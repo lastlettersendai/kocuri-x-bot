@@ -4,7 +4,7 @@ import random
 import time
 import schedule
 import tweepy
-import google.generativeai as palai
+from google import genai
 
 # 警告を非表示にする
 warnings.filterwarnings("ignore")
@@ -41,14 +41,14 @@ def job():
     try:
         print(f"AI文章生成中... (型: {selected_pattern})")
         
-        # --- ここが修正ポイント：APIバージョンを「v1」に完全固定します ---
-        palai.configure(api_key=GEMINI_API_KEY, transport='rest') # 通信方法を安定版に
+        # 404エラーを回避するための最新の接続方法
+        client = genai.Client(api_key=GEMINI_API_KEY, http_options={'api_version': 'v1'})
         
-        # モデル名も「正式なフルネーム」で指定します
-        model = palai.GenerativeModel(model_name='models/gemini-1.5-flash')
-        
-        # 呼び出し時にも明示的に指定（不要な場合もありますが念のため）
-        response = model.generate_content(prompt)
+        # モデル名に「models/」を付与してフルネームで指定
+        response = client.models.generate_content(
+            model='models/gemini-1.5-flash',
+            contents=prompt
+        )
         tweet_text = response.text.strip()
 
         print(f"【生成内容】\n{tweet_text}")
