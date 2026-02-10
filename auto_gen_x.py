@@ -8,14 +8,6 @@ from google import genai
 # 警告を非表示にする
 warnings.filterwarnings("ignore")
 
-# --- 設定：APIキー ---
-API_KEY = "M6xjLm2r7R9JcWlRkEAdSYQSw"
-API_SECRET = "WenjfNnFn0HQ0V7qNfTRTIoRNApOKUy8cwfZyHs39h2IXW2eWh"
-ACCESS_TOKEN = "1779721024017420288-fDFNBLP4SywtLlzao8dFRHNsfGQ4lS"
-ACCESS_TOKEN_SECRET = "crWrH2EI7Z1XfoIEH1sDDkV3Rk7TSNea1ZyLWwqk3Drch"
-GEMINI_API_KEY = "AIzaSyCvj-6N3aWa8wBdBLYc17jtNiriAaplAiM"
-# --------------------
-
 patterns = [
     "1.【常識破壊】「実は◯◯は△△してるだけ」と本質を突く",
     "2.【裏側・真実】業界であまり言われない不都合な真実を暴露",
