@@ -5,6 +5,7 @@ import time
 import schedule
 import tweepy
 from google import genai
+from google.genai import types
 
 # 警告を非表示にする
 warnings.filterwarnings("ignore")
@@ -12,7 +13,7 @@ warnings.filterwarnings("ignore")
 def job():
     print(f"--- 投稿処理開始: {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
     
-    # Railwayの「Variables」から読み込み
+    # Railwayの環境変数から取得
     API_KEY = os.getenv("API_KEY")
     API_SECRET = os.getenv("API_SECRET")
     ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
@@ -23,13 +24,9 @@ def job():
         "1.【常識破壊】「実は◯◯は△△してるだけ」と本質を突く",
         "2.【裏側・真実】業界であまり言われない不都合な真実を暴露",
         "3.【数字×体験談】具体的な変化を数字で示し、信頼を築く",
-        "4.【放置リスク】「今やらないと3年後詰む」と未来の危機を伝える",
-        "5.【成功者の思考】自律神経が整っている人の判断基準（◎、△、×）",
-        "6.【初心者救済】「三日坊主は意志の弱さじゃない」と寄り添う",
-        "7.【テンプレ型】「整うための3ステップ」など保存したくなる箇条書き",
-        "8.【違和感の言語化】「言葉にできない体の不調」を言語化する",
-        "9.【比較・ランキング】疲れのレベル分けや、優先順位の比較",
-        "10.【未完・リプ誘導】結論をあえて伏せ、読み手の興味を引く"
+        "4.【放置リスク】今やらないと3年後詰む",
+        "5.【成功者の思考】自律神経が整っている人の判断基準",
+        "6.【初心者救済】「三日坊主は意志の弱さじゃない」"
     ]
 
     selected_pattern = random.choice(patterns)
@@ -39,15 +36,17 @@ def job():
     prompt = f"あなたは仙台の整体院コクリ店主です。型「{selected_pattern}」とテーマ「{selected_theme}」でX投稿を120文字以内で作成してください。「CS60」「自律神経」を入れ、ハッシュタグは禁止です。"
 
     try:
-        print(f"AI文章生成中... (型: {selected_pattern})")
+        print(f"AI文章生成中... (最新モデル: gemini-3-flash-preview)")
+        # 2026年標準のクライアント初期化
+        client = genai.Client(api_key=GEMINI_API_KEY)
         
-        # 404エラーを回避するための最新の接続方法
-        client = genai.Client(api_key=GEMINI_API_KEY, http_options={'api_version': 'v1'})
-        
-        # モデル名に「models/」を付与してフルネームで指定
+        # 2026年の標準モデル gemini-3-flash-preview を使用
         response = client.models.generate_content(
-            model='models/gemini-1.5-flash',
-            contents=prompt
+            model='gemini-3-flash-preview',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=1.0
+            )
         )
         tweet_text = response.text.strip()
 
@@ -65,13 +64,15 @@ def job():
 
     except Exception as e:
         print(f"エラー発生: {e}")
+        if "404" in str(e):
+            print("💡 アドバイス: モデル名が古い可能性があります。リサーチ結果に基づきモデル名を更新してください。")
 
 # --- 起動設定 ---
 job()
 
 schedule.every().day.at("09:30").do(job)
 
-print("見張り番を起動しました。待機します...")
+print("2026年版 AI広報部長、待機開始...")
 
 while True:
     schedule.run_pending()
