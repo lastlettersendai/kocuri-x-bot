@@ -20,27 +20,44 @@ def job():
     ACCESS_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+    # 型のリスト（タイトルを排除し、AIへの指示内容に簡略化しました）
     patterns = [
-        "1.【常識破壊】「実は◯◯は△△してるだけ」と本質を突く",
-        "2.【裏側・真実】業界であまり言われない不都合な真実を暴露",
-        "3.【数字×体験談】具体的な変化を数字で示し、信頼を築く",
-        "4.【放置リスク】今やらないと3年後詰む",
-        "5.【成功者の思考】自律神経が整っている人の判断基準",
-        "6.【初心者救済】「三日坊主は意志の弱さじゃない」"
+        "常識を覆す本質的な話",
+        "業界のあまり知られていない真実",
+        "具体的な変化と数字を交えた話",
+        "放置するリスクと未来の話",
+        "自律神経が整っている人の習慣",
+        "三日坊主を励ます優しい話",
+        "心身が整うためのステップ紹介",
+        "言葉にできない不調の言語化",
+        "不調レベルの比較や気づき",
+        "続きが気になる興味深い話"
     ]
 
     selected_pattern = random.choice(patterns)
     themes = ["夜中に目が覚める理由", "朝から体が重い原因", "イライラが止まらない脳の状態", "呼吸が浅いサイン"]
     selected_theme = random.choice(themes)
 
-    prompt = f"あなたは仙台の整体院コクリ店主です。型「{selected_pattern}」とテーマ「{selected_theme}」でX投稿を120文字以内で作成してください。「CS60」「自律神経」を入れ、ハッシュタグは禁止です。"
+    # --- 修正されたプロンプト部分 ---
+    prompt = f"""
+あなたは仙台の「整体院コクリ」店主です。
+「{selected_pattern}」という方向性で、「{selected_theme}」についてのX投稿文を作成してください。
+
+＜絶対ルール＞
+1. 冒頭に番号や、「【型】」といったタイトルは絶対に書かないでください。
+2. いきなり本題の文章から書き始めてください。
+3. 信頼できる先生が優しく語りかけるような、自然な口調にしてください。
+4. スマホで読みやすいよう、2〜3行ごとに必ず「空行（改行）」を入れてください。
+5. 文字数は120文字以内。
+6. 「CS60」「自律神経」のキーワードを必ず含めてください。
+7. ハッシュタグは不要です。
+"""
 
     try:
-        print(f"AI文章生成中... (最新モデル: gemini-3-flash-preview)")
-        # 2026年標準のクライアント初期化
+        print(f"AI文章生成中... (方向性: {selected_pattern})")
         client = genai.Client(api_key=GEMINI_API_KEY)
         
-        # 2026年の標準モデル gemini-3-flash-preview を使用
+        # 2026年現役モデル gemini-3-flash-preview を使用
         response = client.models.generate_content(
             model='gemini-3-flash-preview',
             contents=prompt,
@@ -64,15 +81,14 @@ def job():
 
     except Exception as e:
         print(f"エラー発生: {e}")
-        if "404" in str(e):
-            print("💡 アドバイス: モデル名が古い可能性があります。リサーチ結果に基づきモデル名を更新してください。")
 
 # --- 起動設定 ---
 job()
 
+# 毎日 09:30 に定期投稿
 schedule.every().day.at("09:30").do(job)
 
-print("2026年版 AI広報部長、待機開始...")
+print("2026年版 AI広報部長、待機中...")
 
 while True:
     schedule.run_pending()
