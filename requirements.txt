@@ -1,4 +1,4 @@
-google-genai
+google-generativeai
 tweepy
 schedule
 python-dotenv
