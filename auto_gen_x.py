@@ -43,11 +43,15 @@ def job():
         print(f"AI文章生成中... (型: {selected_pattern})")
         client_gemini = genai.Client(api_key=GEMINI_API_KEY)
         
-        # Gemini 1.5 Flash を使用
+        # モデル名の指定を 'gemini-1.5-flash' にして、
+        # シンプルに呼び出す形に書き換えます
         response = client_gemini.models.generate_content(
             model='gemini-1.5-flash', 
             contents=prompt
         )
+        # 最新版では response.text で直接取得できます
+        tweet_text = response.text.strip()
+
         tweet_text = response.text.strip()
 
         print(f"【生成内容】\n{tweet_text}")
