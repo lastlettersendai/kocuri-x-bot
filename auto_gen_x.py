@@ -12,8 +12,7 @@ warnings.filterwarnings("ignore")
 def job():
     print(f"--- 投稿処理開始: {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
     
-    # --- Railwayの「Variables」から読み込み ---
-    # ここは「左にスペース4つ」空いている必要があります
+    # Railwayの「Variables」から読み込み
     API_KEY = os.getenv("API_KEY")
     API_SECRET = os.getenv("API_SECRET")
     ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
@@ -41,7 +40,8 @@ def job():
 
     try:
         print(f"AI文章生成中... (型: {selected_pattern})")
-        client_gemini = genai.Client(api_key=GEMINI_API_KEY, http_options={'api_version': 'v1'})
+        # 404エラーを回避するため、モデル名をフルネームに変更
+        client_gemini = genai.Client(api_key=GEMINI_API_KEY)
         
         response = client_gemini.models.generate_content(
             model='gemini-1.5-flash', 
@@ -64,12 +64,13 @@ def job():
     except Exception as e:
         print(f"エラー発生: {e}")
 
-# --- スケジュール設定（ここは左端にスペースなし） ---
+# --- 起動設定 ---
 job()
 
+# 毎日 09:30 に実行
 schedule.every().day.at("09:30").do(job)
 
-print("見張り番を起動しました。クラウド上で待機します...")
+print("見張り番を起動しました。待機します...")
 
 while True:
     schedule.run_pending()
