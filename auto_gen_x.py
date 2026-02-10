@@ -41,10 +41,13 @@ def job():
     try:
         print(f"AI文章生成中... (型: {selected_pattern})")
         
-        # 最も安定している古い形式の呼び出し方に切り替えます
-        palai.configure(api_key=GEMINI_API_KEY)
-        model = palai.GenerativeModel('gemini-1.5-flash')
+        # --- ここが修正ポイント：APIバージョンを「v1」に完全固定します ---
+        palai.configure(api_key=GEMINI_API_KEY, transport='rest') # 通信方法を安定版に
         
+        # モデル名も「正式なフルネーム」で指定します
+        model = palai.GenerativeModel(model_name='models/gemini-1.5-flash')
+        
+        # 呼び出し時にも明示的に指定（不要な場合もありますが念のため）
         response = model.generate_content(prompt)
         tweet_text = response.text.strip()
 
@@ -66,7 +69,6 @@ def job():
 # --- 起動設定 ---
 job()
 
-# 毎日 09:30 に実行
 schedule.every().day.at("09:30").do(job)
 
 print("見張り番を起動しました。待機します...")
