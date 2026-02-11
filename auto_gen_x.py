@@ -82,13 +82,36 @@ def job():
     except Exception as e:
         print(f"エラー発生: {e}")
 
-# --- 起動設定 ---
-job()
+# --- 修正された起動設定 ---
 
-# 毎日 09:30 に定期投稿
-schedule.every().day.at("09:30").do(job)
+def post_with_delay():
+    """
+    指定時間になったら、0〜30分のランダムな待ち時間を経て投稿を実行する
+    """
+    delay_minutes = random.randint(0, 30)
+    print(f"--- 予約時間になりました。{delay_minutes}分後に生成・投稿を開始します ---")
+    
+    time.sleep(delay_minutes * 60)
+    job()
 
-print("2026年版 AI広報部長、待機中...")
+# 1日6回の投稿スケジュール（野生の勘セット）
+post_times = [
+    "07:30", # 通勤時間
+    "10:00", # 仕事開始後
+    "12:30", # 昼休み
+    "15:30", # 午後の休憩
+    "18:30", # 帰宅時間
+    "21:30"  # 就寝前
+]
+
+# 各時間に対してスケジュールを設定
+for t in post_times:
+    schedule.every().day.at(t).do(post_with_delay)
+
+print(f"2026年版 AI広報部長、1日{len(post_times)}回投稿（＋揺らぎ設定）で待機中...")
+
+# 起動時に1回だけ即時テスト実行したい場合は、以下の job() のコメントアウトを外してください
+job() 
 
 while True:
     schedule.run_pending()
