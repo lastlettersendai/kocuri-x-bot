@@ -10,24 +10,17 @@ import requests
 from google import genai
 from google.genai import types
 
-# =========================
-# 設定（130字×最大3ツリー）
-# =========================
 HISTORY_PATH = "post_history.json"
 MAX_TRIES = 10
 
-TWEET_LIMIT = 130             # 1ポストの安全上限（保険）
-MAX_TWEETS_IN_THREAD = 3      # 最大3ツリー
-MAX_TOTAL_CHARS = 390         # 130×3
+TWEET_LIMIT = 130
+MAX_TWEETS_IN_THREAD = 3
+MAX_TOTAL_CHARS = 390
 
-SIM_THRESHOLD = 0.50          # 類似回避（ほどほど）
-
+SIM_THRESHOLD = 0.50
 post_times = ["07:30", "12:30", "18:30", "21:30"]
 
 
-# =========================
-# 履歴（類似回避）
-# =========================
 def load_history():
     if not os.path.exists(HISTORY_PATH):
         return {"posts": []}
@@ -66,20 +59,11 @@ def is_too_similar(candidate: str, history_posts: list, threshold=SIM_THRESHOLD)
     return False
 
 
-# =========================
-# Gemini：テーマ生成（自由にお題出し）
-# =========================
 def generate_theme_from_gemini(gemini_client):
     prompt = """
-整体師がXでフォロワーを増やすための
-強い共感を生む「お題」を40個出してください。
-
-・症状名だけに限定しない
-・性格、無意識の癖、人間関係、仕事のしんどさも含める
-・抽象語OK
-・少し苦い
-・1行1テーマ
-・解説不要
+整体師がXで使える「お題」を40個。
+抽象OK。症状でも性格でも仕事でも人間関係でもOK。
+1行1テーマ。解説不要。
 """.strip()
 
     try:
@@ -90,14 +74,11 @@ def generate_theme_from_gemini(gemini_client):
         )
         raw = (resp.text or "").strip()
         lines = [l.strip("・- \t") for l in raw.split("\n") if len(l.strip()) > 3]
-        return random.choice(lines) if lines else "ちゃんとしすぎる人の体の反応"
+        return random.choice(lines) if lines else "気を抜けない人の体の反応"
     except Exception:
-        return "ちゃんとしすぎる人の体の反応"
+        return "気を抜けない人の体の反応"
 
 
-# =========================
-# ChatGPT：最終整形（最大390字・売り込みなし）
-# =========================
 def openai_final_edit(text: str) -> str:
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     if not OPENAI_API_KEY:
@@ -106,25 +87,20 @@ def openai_final_edit(text: str) -> str:
     model = os.getenv("OPENAI_MODEL", "gpt-5.2")
 
     prompt = f"""
-あなたはX投稿のプロ編集者です。
-下の文章を「思想7：症状2：自律神経1」で仕上げてください。
+あなたはX投稿の編集者です。下書きを「人間の文章」に整えてください。
 出力は完成文のみ。説明禁止。
 
-【必須】
+【守ること（最小限）】
 ・日本語
-・最初の2行はタイトルのように止める（例：「〜って、たいてい〜」など）
-・余白を残す（改行は2〜6回まで）
-・やさしく少しだけ毒を入れる
-・説明しすぎない（ハウツー禁止）
-・売り込み禁止（予約/来院/プロフィール誘導/宣伝/価格など全部なし）
-・CS60禁止
-・自律神経という単語は最大1回
-・症状ワードは1〜2個まで（首/喉/呼吸/動悸/みぞおち等）
-・断言しすぎない（必ず/絶対/100%は禁止）
-・絵文字/ハッシュタグ/番号（1/2等）禁止
-・全体の長さは最大{MAX_TOTAL_CHARS}文字以内（短いのはOK）
+・同じ文や同じ意味の繰り返しは禁止（重複は削る）
+・売り込み禁止（予約/来院/プロフィール誘導/宣伝/価格など禁止）
+・絵文字/ハッシュタグ/番号（1/2など）禁止
+・体の具体を最低1つ入れる（首/喉/呼吸/胸/みぞおち/奥歯など）
+・日常の場面を1つ入れる（仕事中/電車/布団など）
+・最初の2行は短く止める（タイトル風）
+・全体は最大{MAX_TOTAL_CHARS}文字以内（短いのはOK）
 
-【元文章】
+【下書き】
 {text}
 """.strip()
 
@@ -146,7 +122,6 @@ def openai_final_edit(text: str) -> str:
                         out += c.get("text", "")
             out = out.strip() if out else text
 
-        # 念のため上限だけ守る（途中で切るのが嫌なら、ここは削ってもOK）
         if len(out) > MAX_TOTAL_CHARS:
             out = out[:MAX_TOTAL_CHARS].rstrip()
 
@@ -156,10 +131,7 @@ def openai_final_edit(text: str) -> str:
         return text
 
 
-# =========================
-# 分割：最大3ツリー、1ポスト130字、番号は付けない
-# =========================
-def split_into_thread(text: str, max_len=TWEET_LIMIT, max_parts=MAX_TWEETS_IN_THREAD):
+def split_into_thread(text: str):
     text = (text or "").strip()
     if not text:
         return []
@@ -167,79 +139,58 @@ def split_into_thread(text: str, max_len=TWEET_LIMIT, max_parts=MAX_TWEETS_IN_TH
     if len(text) > MAX_TOTAL_CHARS:
         text = text[:MAX_TOTAL_CHARS].rstrip()
 
-    parts = []
-    remaining = text
+    parts, remaining = [], text
 
-    while remaining and len(parts) < max_parts:
-        if len(remaining) <= max_len:
+    while remaining and len(parts) < MAX_TWEETS_IN_THREAD:
+        if len(remaining) <= TWEET_LIMIT:
             parts.append(remaining.strip())
             break
 
-        window = remaining[:max_len+1]
-
-        # なるべく自然に切る（句点/改行優先）
+        window = remaining[:TWEET_LIMIT+1]
         candidates = []
         for m in re.finditer(r"\n", window):
             candidates.append(m.start())
         for m in re.finditer(r"[。！？!?]", window):
             candidates.append(m.end())
 
-        if candidates:
-            cut = max(candidates)
-        else:
-            cut = max_len
-
+        cut = max(candidates) if candidates else TWEET_LIMIT
         if cut < 20:
-            cut = max_len
+            cut = TWEET_LIMIT
 
         part = remaining[:cut].strip()
         remaining = remaining[cut:].strip()
-
         if part:
             parts.append(part)
 
-    # まだ残ってるなら最後に詰める（超過分はカット）
     if remaining and parts:
-        last = (parts[-1] + "\n" + remaining).strip()
-        parts[-1] = last[:max_len].rstrip()
+        parts[-1] = (parts[-1] + "\n" + remaining)[:TWEET_LIMIT].rstrip()
 
-    return [p for p in parts if p.strip()][:max_parts]
+    return [p for p in parts if p.strip()]
 
 
-# =========================
-# 生成フロー：Gemini（お題→下書き）→ChatGPT（整形）
-# =========================
 def generate_post_text(gemini_client):
     history = load_history()
     history_posts = history.get("posts", [])
-
     last_candidate = ""
 
     for _ in range(MAX_TRIES):
         theme = generate_theme_from_gemini(gemini_client)
 
+        # Geminiはかなり自由。ただし事故防止だけ入れる
         writer_prompt = f"""
-あなたは整体師ナベジュン。
-以下の「お題」から、X投稿の下書きを作ってください。
+お題：{theme}
 
-お題：
-{theme}
+X投稿の下書きを自由に作ってください。
+文体も長さも自由。最大{MAX_TOTAL_CHARS}文字以内。
 
-【条件】
-・思想7：症状2：自律神経1
-・売り込み禁止／ハウツー禁止
-・CS60禁止
-・自律神経という単語は最大1回
-・症状ワードは1〜2個
-・最初の2行はタイトルのように止める
-・絵文字/ハッシュタグ/番号（1/2等）禁止
-・長さはお任せ（ただし最大{MAX_TOTAL_CHARS}文字以内）
+禁止：売り込み、予約誘導、CS60、絵文字、ハッシュタグ、番号（1/2など）
+条件：体の具体を最低1つ、日常の場面を1つ
 """.strip()
 
         draft_resp = gemini_client.models.generate_content(
             model="gemini-3-flash-preview",
             contents=writer_prompt,
-            config=types.GenerateContentConfig(temperature=1.1)
+            config=types.GenerateContentConfig(temperature=1.2)
         )
         draft = (draft_resp.text or "").strip()
         if not draft:
@@ -248,9 +199,6 @@ def generate_post_text(gemini_client):
         final = openai_final_edit(draft).strip()
         if not final:
             continue
-
-        if len(final) > MAX_TOTAL_CHARS:
-            final = final[:MAX_TOTAL_CHARS].rstrip()
 
         last_candidate = final
 
@@ -264,25 +212,11 @@ def generate_post_text(gemini_client):
 
         return final
 
-    # どうしてもダメなら「最後に作れた候補」を返す（毎回固定文にならない）
-    if last_candidate:
-        return last_candidate
-
-    # それすら無理なら超短い保険（ここに来る確率はかなり低い）
-    return "ちゃんとしすぎる人って。\n\nだいたい、止まれない。"
+    return last_candidate if last_candidate else "気を抜けない人ほど、体が先に止まる。"
 
 
-# =========================
-# 投稿処理
-# =========================
 def job():
     print(f"--- 投稿処理開始: {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
-
-    API_KEY = os.getenv("API_KEY")
-    API_SECRET = os.getenv("API_SECRET")
-    ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
-    ACCESS_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
     missing = [k for k in ["API_KEY","API_SECRET","ACCESS_TOKEN","ACCESS_TOKEN_SECRET","GEMINI_API_KEY"] if not os.getenv(k)]
     if missing:
@@ -290,21 +224,20 @@ def job():
         return
 
     try:
-        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
         full_text = generate_post_text(gemini_client)
-
-        print(f"【生成内容（全文）】\n{full_text}")
+        print(f"【生成内容】\n{full_text}")
 
         client_x = tweepy.Client(
-            consumer_key=API_KEY,
-            consumer_secret=API_SECRET,
-            access_token=ACCESS_TOKEN,
-            access_token_secret=ACCESS_TOKEN_SECRET
+            consumer_key=os.getenv("API_KEY"),
+            consumer_secret=os.getenv("API_SECRET"),
+            access_token=os.getenv("ACCESS_TOKEN"),
+            access_token_secret=os.getenv("ACCESS_TOKEN_SECRET")
         )
 
-        parts = split_into_thread(full_text, max_len=TWEET_LIMIT, max_parts=MAX_TWEETS_IN_THREAD)
+        parts = split_into_thread(full_text)
         if not parts:
-            print("生成失敗（空）")
+            print("生成失敗")
             return
 
         first = client_x.create_tweet(text=parts[0])
@@ -314,21 +247,17 @@ def job():
             r = client_x.create_tweet(text=p, in_reply_to_tweet_id=last_id)
             last_id = r.data["id"]
 
-        print(f"✅ 投稿成功！（{len(parts)}ツイート / 1ツイ最大{TWEET_LIMIT}字）")
+        print(f"✅ 投稿成功！（{len(parts)}ツリー）")
 
     except Exception as e:
         print(f"エラー発生: {e}")
 
 
-# =========================
-# スケジュール
-# =========================
 for t in post_times:
     schedule.every().day.at(t).do(job)
 
-print(f"思想モードAI広報 起動完了（1日{len(post_times)}回 / 最大{MAX_TWEETS_IN_THREAD}ツリー / 1ツイ{TWEET_LIMIT}字）")
+print(f"自由下書き→ChatGPT整形 起動完了（1日{len(post_times)}回 / 最大3ツリー / 1ツイ130字）")
 
-# 起動時に1回実行
 job()
 
 while True:
