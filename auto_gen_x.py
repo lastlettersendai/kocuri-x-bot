@@ -199,7 +199,7 @@ for t in POST_TIMES:
 print(f"2ツリー固定 起動完了（1日{len(POST_TIMES)}回 / 130字×最大2）")
 
 # デプロイ時に1回実行したくない場合は下の1行をコメントアウト
-# job()
+job()
 
 while True:
     schedule.run_pending()
