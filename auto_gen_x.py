@@ -3,7 +3,6 @@ import time
 import random
 import schedule
 import tweepy
-import requests
 import re
 import json
 from datetime import datetime, timedelta
@@ -30,6 +29,11 @@ JITTER_MINUTES = 7
 # 視点ローテーション
 VIEWPOINTS = ["安心", "反論", "暴露", "解説"]
 HISTORY_PATH = "post_history.json"
+
+# Gemini
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+GEMINI_TEMP_DRAFT = float(os.getenv("GEMINI_TEMP_DRAFT", "1.2"))
+GEMINI_TEMP_POLISH = float(os.getenv("GEMINI_TEMP_POLISH", "0.3"))
 
 # =========================
 # 視点履歴
@@ -98,26 +102,31 @@ def gemini_draft(gemini_client, viewpoint: str) -> str:
 """.strip()
 
     r = gemini_client.models.generate_content(
-        model="gemini-3-flash-preview",
+        model=MODEL_NAME,
         contents=prompt,
-        config=types.GenerateContentConfig(temperature=1.2)
+        config=types.GenerateContentConfig(temperature=GEMINI_TEMP_DRAFT)
     )
     return (r.text or "").strip()
 
 # =========================
-# ChatGPT：軽く整える（作り変えない）
+# Gemini：軽く整える（OpenAIがやってた役割の置き換え）
 # =========================
-def chatgpt_polish(text: str) -> str:
-    key = os.getenv("OPENAI_API_KEY")
-    if not key:
+def gemini_polish(gemini_client, text: str) -> str:
+    """
+    下書きを自然に整える。大きく作り変えない。
+    ・読みやすく整える
+    ・不自然な重複を削る
+    ・売り込みを入れない
+    ・絵文字/ハッシュタグ/番号を入れない
+    ・最大MAX_TOTAL_CHARS文字以内
+    """
+    if not text:
         return text
 
-    model = os.getenv("OPENAI_MODEL", "gpt-5.2")
-
     prompt = f"""
-あなたはX投稿の編集者です。
+あなたはX投稿のプロの編集者です。
 下書きを自然に整えてください。
-大きく作り変えず、温度は残す。
+大きく作り変えず、温度は残してください。
 
 【やること】
 ・読みやすく整える
@@ -132,29 +141,16 @@ def chatgpt_polish(text: str) -> str:
 {text}
 """.strip()
 
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    payload = {"model": model, "input": prompt}
-
     try:
-        r = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-
-        if isinstance(data.get("output_text"), str):
-            out = data["output_text"].strip()
-        else:
-            out = ""
-            for item in data.get("output", []):
-                for c in item.get("content", []):
-                    if c.get("type") in ("output_text", "text"):
-                        out += c.get("text", "")
-            out = (out or "").strip() or text
-
+        r = gemini_client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=GEMINI_TEMP_POLISH)
+        )
+        out = (r.text or "").strip() or text
         if len(out) > MAX_TOTAL_CHARS:
             out = out[:MAX_TOTAL_CHARS].rstrip()
-
         return out
-
     except Exception:
         return text
 
@@ -220,7 +216,7 @@ def job():
         print(f"【今回の視点】{viewpoint}")
 
         draft = gemini_draft(gemini_client, viewpoint=viewpoint)
-        final = chatgpt_polish(draft)
+        final = gemini_polish(gemini_client, draft)
         final = remove_consecutive_duplicate_lines(final)
 
         if not final:
