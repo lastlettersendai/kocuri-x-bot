@@ -27,11 +27,10 @@ TZ = ZoneInfo("Asia/Tokyo")
 SENDAI_LAT = 38.2682
 SENDAI_LON = 140.8694
 
-DROP_PER_HOUR_THRESHOLD = -1.5
 POST_HOUR = 6
+OPENAI_MODEL = "gpt-5"
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
-MAX_LEN = 135
+THREAD_SPLIT = 150  # 1ツイ目目安
 
 # =========================
 # クライアント
@@ -47,7 +46,7 @@ x_client = tweepy.Client(
 oa_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =========================
-# Open-Meteo 取得
+# 気象データ取得
 # =========================
 def fetch_weather():
     url = (
@@ -71,143 +70,150 @@ def fetch_weather():
     )
 
 # =========================
-# 急降下検出
+# トレンド判定ロジック
 # =========================
-def find_drop(times_dt, pressures):
-    for i in range(len(pressures)-1):
-        diff = pressures[i+1] - pressures[i]
-        if diff <= DROP_PER_HOUR_THRESHOLD:
-            return diff
-    return None
+def detect_trend(base, p12, p18, p24):
+    values = [base, p12, p18, p24]
+    diffs = [values[i+1] - values[i] for i in range(len(values)-1)]
+
+    total_change = values[-1] - values[0]
+    worst_drop = min(diffs)
+
+    if worst_drop <= -1.5:
+        return "急降下"
+    if total_change <= -2:
+        return "やや下降"
+    return "安定"
 
 # =========================
-# 天気絵文字判定
+# 天気コメント
 # =========================
-def weather_emoji(code, temp):
+def weather_impression(code, temp, humidity):
     if 71 <= code <= 77 and temp <= 3:
-        return "❄️"
+        return "雪やみぞれの可能性もありそうです。"
     if 51 <= code <= 67:
-        return "🌧"
+        return "しっとりした空模様になりそうです。"
     if code == 0:
-        return "☀️"
+        if temp >= 28:
+            return "強い日差しになりそうです。"
+        return "すっきり晴れそうな一日です。"
     if 1 <= code <= 3:
-        return "⛅"
-    return "☁️"
+        if humidity >= 80 and temp >= 23:
+            return "少し蒸しっとしそうな空気です。"
+        return "くもりがちな空模様です。"
+    return "落ち着いた空気の一日になりそうです。"
 
 # =========================
-# 投稿生成プロンプト
+# 投稿生成
 # =========================
-SYSTEM_PROMPT = """
-あなたは仙台在住者向けの天気痛・低気圧頭痛予報を作成する専門家です。
-
-必ず以下のフォーマットと改行位置を守って出力してください。
-
-【仙台の天気痛・低気圧頭痛予報】{date}
+def generate_post(material):
+    prompt = f"""
+【仙台の天気痛・低気圧頭痛予報】{material['date']}
 
 おはようございます。
-整体院コクリの気圧予報です{weather_emoji}
+整体院コクリの気圧予報です☀️
 
-12時{h12}hPa｜18時{h18}hPa｜24時{h24}hPa
-朝6時の基準は{base}hPa。
+12時{material['h12']}hPa｜18時{material['h18']}hPa｜24時{material['h24']}hPa
+朝6時の基準は{material['base']}hPa。
 
-今日は{trend}
-{impact}
-{weather_comment}
-
-【厳守ルール】
-
-・必ず135文字以内
-・完成文のみ出力
-・絵文字は1つだけ
-・怖がらせない
-・生活アドバイスを書かない
-・宣伝しない
+今日は【{material['trend']}】傾向です。
+{material['impact']}
+{material['weather_comment']}
+穏やかな一日になりますように。
 """
 
-def generate_post(material):
-    resp = oa_client.responses.create(
+    response = oa_client.responses.create(
         model=OPENAI_MODEL,
-        instructions=SYSTEM_PROMPT,
-        input=json.dumps(material, ensure_ascii=False)
+        input=prompt
     )
-    text = resp.output_text.strip()
-    if len(text) > MAX_LEN:
-        text = text[:MAX_LEN]
-    return text
+    return response.output_text.strip()
+
+# =========================
+# ツリー分割
+# =========================
+def split_into_thread(text):
+    if len(text) <= THREAD_SPLIT:
+        return [text]
+
+    cut = text.rfind("\n", 0, THREAD_SPLIT)
+    if cut < 20:
+        cut = THREAD_SPLIT
+
+    return [text[:cut].strip(), text[cut:].strip()]
 
 # =========================
 # 投稿処理
 # =========================
 def post_forecast():
     now = datetime.now(TZ)
-    times, pressures, temps, hums, codes = fetch_weather()
-
-    times_dt = [datetime.fromisoformat(t).replace(tzinfo=TZ) for t in times]
-    pressures = [float(p) for p in pressures]
-    temps = [float(t) for t in temps]
-    codes = [int(c) for c in codes]
-
     today = now.date()
 
-    tmap = {
-        times_dt[i]: {
-            "pressure": pressures[i],
-            "temp": temps[i],
-            "code": codes[i]
-        }
-        for i in range(len(times_dt))
-    }
+    times, pressures, temps, hums, codes = fetch_weather()
 
-    base_dt = datetime.combine(today, dtime(6,0), TZ)
-    base_p = tmap.get(base_dt, list(tmap.values())[0])["pressure"]
+    tmap = {
+        datetime.fromisoformat(t).replace(tzinfo=TZ): {
+            "pressure": float(p),
+            "temp": float(tmp),
+            "hum": float(h),
+            "code": int(c)
+        }
+        for t, p, tmp, h, c in zip(times, pressures, temps, hums, codes)
+    }
 
     def get_data(hour):
         if hour == 24:
-            dt = datetime.combine(today + timedelta(days=1), dtime(0,0), TZ)
+            dt = datetime.combine(today + timedelta(days=1), dtime(0, 0), TZ)
         else:
-            dt = datetime.combine(today, dtime(hour,0), TZ)
+            dt = datetime.combine(today, dtime(hour, 0), TZ)
+        return tmap.get(dt, list(tmap.values())[0])
 
-        if dt in tmap:
-            return tmap[dt]
+    base_dt = datetime.combine(today, dtime(6, 0), TZ)
+    base_p = round(tmap.get(base_dt, list(tmap.values())[0])["pressure"])
 
-        return list(tmap.values())[0]
+    d12 = round(get_data(12)["pressure"])
+    d18 = round(get_data(18)["pressure"])
+    d24 = round(get_data(24)["pressure"])
 
-    d12 = get_data(12)
-    d18 = get_data(18)
-    d24 = get_data(24)
+    trend = detect_trend(base_p, d12, d18, d24)
 
-    drop = find_drop(times_dt, pressures)
-
-    if drop:
-        trend = "【やや下がる】傾向です。"
+    if trend == "急降下":
+        impact = "気圧の変動がやや大きめです。"
+    elif trend == "やや下降":
         impact = "敏感な方は少し注意が必要です。"
     else:
-        trend = "【安定】傾向です。"
         impact = "体調への影響は少なそうです。"
 
-    weather_comment = "穏やかな一日になりそうですね。"
-
-    emoji = weather_emoji(d12["code"], d12["temp"])
+    weather_comment = weather_impression(
+        get_data(12)["code"],
+        get_data(12)["temp"],
+        get_data(12)["hum"]
+    )
 
     material = {
         "date": now.strftime("%m月%d日"),
-        "h12": round(d12["pressure"]),
-        "h18": round(d18["pressure"]),
-        "h24": round(d24["pressure"]),
-        "base": round(base_p),
+        "h12": d12,
+        "h18": d18,
+        "h24": d24,
+        "base": base_p,
         "trend": trend,
         "impact": impact,
-        "weather_comment": weather_comment,
-        "weather_emoji": emoji
+        "weather_comment": weather_comment
     }
 
     post_text = generate_post(material)
 
-    try:
-        x_client.create_tweet(text=post_text)
-        print("投稿完了:", post_text)
-    except Exception as e:
-        print("投稿エラー:", e)
+    parts = split_into_thread(post_text)
+
+    first = x_client.create_tweet(text=parts[0])
+    last_id = first.data["id"]
+
+    if len(parts) > 1:
+        x_client.create_tweet(
+            text=parts[1],
+            in_reply_to_tweet_id=last_id
+        )
+
+    print("投稿完了")
 
 # =========================
 # 常駐
@@ -217,7 +223,6 @@ def run_bot():
     print("気圧痛予報BOT 起動")
 
     if DEPLOY_RUN:
-        print("デプロイ即時投稿")
         post_forecast()
         last_post_date = datetime.now(TZ).date()
 
