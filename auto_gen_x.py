@@ -6,7 +6,7 @@ import tweepy
 import requests
 import re
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import warnings
 
 from google import genai
@@ -21,7 +21,11 @@ TWEET_LIMIT = 130
 MAX_TWEETS_IN_THREAD = 2
 MAX_TOTAL_CHARS = TWEET_LIMIT * MAX_TWEETS_IN_THREAD  # 260
 
-POST_TIMES = ["07:30", "12:30", "18:30", "21:30"]
+# 固定の基準時刻（ここは変えない）
+POST_TIMES = ["12:30", "21:30"]
+
+# 揺らぎ（±分）
+JITTER_MINUTES = 7
 
 # 視点ローテーション
 VIEWPOINTS = ["安心", "反論", "暴露", "解説"]
@@ -249,15 +253,55 @@ def job():
         print(f"エラー: {e}")
 
 # =========================
-# スケジュール設定
+# 揺らぎスケジュール（毎日作り直す）
 # =========================
-for t in POST_TIMES:
-    schedule.every().day.at(t).do(job)
+def jitter_time_str(base_hhmm: str, jitter_minutes: int) -> str:
+    """
+    base_hhmm (例 '12:30') に対して ±jitter_minutes の範囲でランダムに揺らす。
+    返り値は 'HH:MM'。
+    """
+    h, m = map(int, base_hhmm.split(":"))
+    base = datetime(2000, 1, 1, h, m)
+    offset = random.randint(-jitter_minutes, jitter_minutes)
+    t = base + timedelta(minutes=offset)
+    return t.strftime("%H:%M")
 
+def schedule_today_with_jitter():
+    """
+    当日分の投稿を、基準POST_TIMESからランダムに揺らして登録する。
+    schedule.clear('posts')で毎日作り直す前提。
+    """
+    schedule.clear('posts')
+    actual_times = []
+    for base in POST_TIMES:
+        actual = jitter_time_str(base, JITTER_MINUTES)
+        schedule.every().day.at(actual).do(job).tag('posts')
+        actual_times.append((base, actual))
+    print("📌 本日の投稿時刻（揺らぎ適用）:", ", ".join([f"{b}→{a}" for b, a in actual_times]))
+
+def reschedule_job():
+    """
+    日付が変わったら当日分の投稿時刻を作り直す。
+    00:01に実行。
+    """
+    schedule_today_with_jitter()
+
+# =========================
+# 起動
+# =========================
 print(f"2ツリー固定×視点ローテ 起動完了（1日{len(POST_TIMES)}回 / 130字×最大2 / 4視点）")
+print(f"揺らぎ：±{JITTER_MINUTES}分 / 基準時刻: {POST_TIMES}")
 
-job()
+# 当日分を登録
+schedule_today_with_jitter()
+
+# 毎日0:01に翌日の揺らぎを作り直す（タグごと作り直し）
+schedule.every().day.at("00:01").do(reschedule_job)
+
+# デプロイ時に即投稿したい場合だけ（任意）
+if os.getenv("DEPLOY_RUN", "0") == "1":
+    job()
 
 while True:
     schedule.run_pending()
-    time.sleep(60)
+    time.sleep(30)
