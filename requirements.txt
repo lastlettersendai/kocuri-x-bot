@@ -2,3 +2,4 @@ google-genai
 tweepy
 schedule
 python-dotenv
+openai
