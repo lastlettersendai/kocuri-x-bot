@@ -1,11 +1,11 @@
 import os
 import time
 import random
-import schedule
 import tweepy
 import re
 import json
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import warnings
 
 from google import genai
@@ -20,11 +20,14 @@ TWEET_LIMIT = 130
 MAX_TWEETS_IN_THREAD = 2
 MAX_TOTAL_CHARS = TWEET_LIMIT * MAX_TWEETS_IN_THREAD  # 260
 
-# 固定の基準時刻（ここは変えない）
+# 固定の基準時刻（JST基準で解釈する）
 POST_TIMES = ["12:30", "21:30"]
 
 # 揺らぎ（±分）
 JITTER_MINUTES = 7
+
+# タイムゾーン（ここが最重要）
+TZ = ZoneInfo("Asia/Tokyo")
 
 # 視点ローテーション
 VIEWPOINTS = ["安心", "反論", "暴露", "解説"]
@@ -34,6 +37,9 @@ HISTORY_PATH = "post_history.json"
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 GEMINI_TEMP_DRAFT = float(os.getenv("GEMINI_TEMP_DRAFT", "1.2"))
 GEMINI_TEMP_POLISH = float(os.getenv("GEMINI_TEMP_POLISH", "0.3"))
+
+# デプロイ即投稿フラグ
+DEPLOY_RUN = (os.getenv("DEPLOY_RUN", "0") == "1")
 
 # =========================
 # 視点履歴
@@ -60,7 +66,7 @@ def next_viewpoint():
     idx = (last + 1) % len(VIEWPOINTS)
     vp = VIEWPOINTS[idx]
     h["last_viewpoint"] = idx
-    h["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    h["updated_at"] = datetime.now(TZ).isoformat(timespec="seconds")
     save_history(h)
     return vp
 
@@ -112,14 +118,6 @@ def gemini_draft(gemini_client, viewpoint: str) -> str:
 # Gemini：軽く整える（OpenAIがやってた役割の置き換え）
 # =========================
 def gemini_polish(gemini_client, text: str) -> str:
-    """
-    下書きを自然に整える。大きく作り変えない。
-    ・読みやすく整える
-    ・不自然な重複を削る
-    ・売り込みを入れない
-    ・絵文字/ハッシュタグ/番号を入れない
-    ・最大MAX_TOTAL_CHARS文字以内
-    """
     if not text:
         return text
 
@@ -202,7 +200,7 @@ def split_into_thread(text: str):
 # 投稿処理
 # =========================
 def job():
-    print(f"--- 投稿開始: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
+    print(f"--- 投稿開始(JST): {datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')} ---")
 
     missing = [k for k in ["API_KEY","API_SECRET","ACCESS_TOKEN","ACCESS_TOKEN_SECRET","GEMINI_API_KEY"] if not os.getenv(k)]
     if missing:
@@ -249,55 +247,78 @@ def job():
         print(f"エラー: {e}")
 
 # =========================
-# 揺らぎスケジュール（毎日作り直す）
+# JST固定：毎日「12:30/21:30（±7分）」の“実行時刻”を作る
 # =========================
-def jitter_time_str(base_hhmm: str, jitter_minutes: int) -> str:
-    """
-    base_hhmm (例 '12:30') に対して ±jitter_minutes の範囲でランダムに揺らす。
-    返り値は 'HH:MM'。
-    """
-    h, m = map(int, base_hhmm.split(":"))
-    base = datetime(2000, 1, 1, h, m)
-    offset = random.randint(-jitter_minutes, jitter_minutes)
-    t = base + timedelta(minutes=offset)
-    return t.strftime("%H:%M")
+def parse_hhmm(hhmm: str):
+    h, m = map(int, hhmm.split(":"))
+    return h, m
 
-def schedule_today_with_jitter():
+def make_jittered_run_times_for_date(day_date):
     """
-    当日分の投稿を、基準POST_TIMESからランダムに揺らして登録する。
-    schedule.clear('posts')で毎日作り直す前提。
+    day_date（date）に対し、POST_TIMESそれぞれを±JITTER_MINUTES揺らした
+    実行予定時刻(datetime, JST)のリストを返す。
     """
-    schedule.clear('posts')
-    actual_times = []
+    runs = []
     for base in POST_TIMES:
-        actual = jitter_time_str(base, JITTER_MINUTES)
-        schedule.every().day.at(actual).do(job).tag('posts')
-        actual_times.append((base, actual))
-    print("📌 本日の投稿時刻（揺らぎ適用）:", ", ".join([f"{b}→{a}" for b, a in actual_times]))
+        h, m = parse_hhmm(base)
+        base_dt = datetime(day_date.year, day_date.month, day_date.day, h, m, tzinfo=TZ)
+        offset = random.randint(-JITTER_MINUTES, JITTER_MINUTES)
+        run_dt = base_dt + timedelta(minutes=offset)
+        runs.append((base, run_dt))
+    # 時刻順に
+    runs.sort(key=lambda x: x[1])
+    return runs
 
-def reschedule_job():
-    """
-    日付が変わったら当日分の投稿時刻を作り直す。
-    00:01に実行。
-    """
-    schedule_today_with_jitter()
+def print_today_schedule(runs):
+    s = ", ".join([f"{b}→{dt.strftime('%H:%M')}" for b, dt in runs])
+    print(f"📌 本日の投稿時刻（JST/揺らぎ適用）: {s}")
 
 # =========================
-# 起動
+# 起動（scheduleを使わない）
 # =========================
-print(f"2ツリー固定×視点ローテ 起動完了（1日{len(POST_TIMES)}回 / 130字×最大2 / 4視点）")
+print(f"JST固定 起動完了（1日{len(POST_TIMES)}回 / 130字×最大2 / 4視点）")
 print(f"揺らぎ：±{JITTER_MINUTES}分 / 基準時刻: {POST_TIMES}")
+print(f"DEPLOY_RUN: {DEPLOY_RUN}")
 
-# 当日分を登録
-schedule_today_with_jitter()
-
-# 毎日0:01に翌日の揺らぎを作り直す（タグごと作り直し）
-schedule.every().day.at("00:01").do(reschedule_job)
-
-# デプロイ時に即投稿したい場合だけ（任意）
-if os.getenv("DEPLOY_RUN", "0") == "1":
+# デプロイ時に即投稿（任意）
+if DEPLOY_RUN:
     job()
 
+# 当日分の実行予定を作る
+today = datetime.now(TZ).date()
+runs = make_jittered_run_times_for_date(today)
+print_today_schedule(runs)
+
+# 当日分の「消化フラグ」
+done = set()  # run_dt.isoformat() を入れる
+
 while True:
-    schedule.run_pending()
-    time.sleep(30)
+    now = datetime.now(TZ)
+
+    # 日付が変わったら翌日分を作り直す
+    if now.date() != today:
+        today = now.date()
+        runs = make_jittered_run_times_for_date(today)
+        done.clear()
+        print_today_schedule(runs)
+
+    # 予定時刻を過ぎたら実行（各枠1回だけ）
+    for base, run_dt in runs:
+        key = run_dt.isoformat()
+        if key in done:
+            continue
+
+        # run_dt〜run_dt+5分の間に拾えればOK（取り逃し防止）
+        if run_dt <= now <= (run_dt + timedelta(minutes=5)):
+            print(f"⏰ 実行(JST): base={base} / run={run_dt.strftime('%H:%M')} / now={now.strftime('%H:%M:%S')}")
+            job()
+            done.add(key)
+
+        # もし大幅に遅れてnowがrun_dt+5分を超えた場合も、1回だけ救済実行
+        elif now > (run_dt + timedelta(minutes=5)):
+            # 遅延救済：run_dtを過ぎてるのに未実行だったら実行してしまう
+            print(f"⚠️ 取り逃し救済(JST): base={base} / run={run_dt.strftime('%H:%M')} / now={now.strftime('%H:%M:%S')}")
+            job()
+            done.add(key)
+
+    time.sleep(20)
