@@ -24,15 +24,14 @@ DEPLOY_RUN = (os.getenv("DEPLOY_RUN", "0") == "1")
 # 設定
 # =========================
 TZ = ZoneInfo("Asia/Tokyo")
-
 SENDAI_LAT = 38.2682
 SENDAI_LON = 140.8694
 
 DROP_PER_HOUR_THRESHOLD = -1.5
 POST_HOUR = 6
-POST_MINUTE = 0
 
 OPENAI_MODEL = "gpt-5"
+MAX_LEN = 135
 
 # =========================
 # クライアント初期化
@@ -62,16 +61,7 @@ def fetch_pressure():
     r = requests.get(url, timeout=20)
     r.raise_for_status()
     j = r.json()
-    times = j["hourly"]["time"]
-    pressures = j["hourly"]["surface_pressure"]
-    return times, pressures
-
-def build_map(times, pressures):
-    tmap = {}
-    for t, p in zip(times, pressures):
-        dt = datetime.fromisoformat(t).replace(tzinfo=TZ)
-        tmap[dt] = float(p)
-    return tmap
+    return j["hourly"]["time"], j["hourly"]["surface_pressure"]
 
 def find_drop_band(times_dt, pressures):
     worst = None
@@ -89,15 +79,16 @@ def find_drop_band(times_dt, pressures):
 # 投稿文生成
 # =========================
 SYSTEM_PROMPT = """あなたはX投稿のプロコピーライターです。
-毎朝6:00時点の「仙台｜低気圧頭痛・気圧痛予報」を作ります。
+毎朝6:00時点の「仙台｜低気圧頭痛予報」を作ります。
 
 条件：
-・1行目固定：【仙台｜低気圧頭痛・気圧痛予報】
-・2行目固定：おはようございます。本日の気圧痛予報です。
-・12時/18時/24時のhPaと差分を1行でまとめる
-・急降下帯があれば「急降下帯：◯時〜◯時（-XhPa）」を入れる
-・最後は安心で締める
-・140〜220文字
+・1行目固定：【仙台｜低気圧頭痛予報】
+・2行目固定：仙台の皆さん、おはようございます（^-^）
+・結論を先に（安定／少し下がる／急降下）
+・数字は12時と18時と24時を自然表記（例：12時1010hPa、18時1008hPa）
+・急降下時だけその時間帯と差分（-XhPa）を入れて短めのアドバイスで締める
+・それ以外でも優しく締める
+・135文字以内（絶対）
 ・ハッシュタグなし
 """
 
@@ -107,51 +98,57 @@ def generate_post(material):
         instructions=SYSTEM_PROMPT,
         input=json.dumps(material, ensure_ascii=False)
     )
-    return response.output_text.strip()
+    text = response.output_text.strip()
+    if len(text) > MAX_LEN:
+        text = text[:MAX_LEN]
+    return text
 
 # =========================
-# メイン投稿処理
+# 投稿処理
 # =========================
 def post_forecast():
     now = datetime.now(TZ)
     times, pressures = fetch_pressure()
     times_dt = [datetime.fromisoformat(t).replace(tzinfo=TZ) for t in times]
-    tmap = build_map(times, pressures)
+    pressures = [float(p) for p in pressures]
 
     today = now.date()
+    base_dt = datetime.combine(today, dtime(6,0), TZ)
 
-    base = datetime.combine(today, dtime(6,0), TZ)
-    base_p = tmap.get(base, pressures[0])
+    # 気圧マップ作成
+    tmap = {datetime.fromisoformat(t).replace(tzinfo=TZ): float(p)
+            for t,p in zip(times, pressures)}
+
+    base_p = tmap.get(base_dt, pressures[0])
 
     def get_hpa(h):
         dt = datetime.combine(today, dtime(h,0), TZ)
-        return tmap.get(dt, base_p)
+        return round(tmap.get(dt, base_p))
 
     h12 = get_hpa(12)
     h18 = get_hpa(18)
-    h24 = tmap.get(datetime.combine(today+timedelta(days=1), dtime(0,0), TZ), base_p)
 
     band = find_drop_band(times_dt, pressures)
 
     material = {
-        "base": round(base_p),
-        "points": [
-            {"label":"12時","hpa":round(h12),"diff":round(h12-base_p)},
-            {"label":"18時","hpa":round(h18),"diff":round(h18-base_p)},
-            {"label":"24時","hpa":round(h24),"diff":round(h24-base_p)}
-        ],
-        "drop_band": {
-            "start": band[0].hour if band else None,
-            "end": band[1].hour if band else None,
-            "drop": round(band[2]) if band else None
-        }
+        "h12": h12,
+        "h18": h18,
+        "has_drop": bool(band),
+        "drop_diff": round(band[2]) if band else None
     }
 
     post_text = generate_post(material)
 
-    res = x_client.create_tweet(text=post_text)
-    print("投稿完了:", post_text)
-    return True
+    try:
+        x_client.create_tweet(text=post_text)
+        print("投稿完了:", post_text)
+        return True
+    except tweepy.errors.Forbidden as e:
+        print("403 Forbidden:", e)
+        return False
+    except Exception as e:
+        print("投稿エラー:", e)
+        return False
 
 # =========================
 # 常駐ループ
@@ -163,6 +160,7 @@ def run_bot():
     if DEPLOY_RUN:
         print("デプロイ即時投稿")
         post_forecast()
+        last_post_date = datetime.now(TZ).date()
 
     while True:
         now = datetime.now(TZ)
