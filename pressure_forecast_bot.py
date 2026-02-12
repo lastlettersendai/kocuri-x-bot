@@ -1,6 +1,7 @@
 import os
 import time
 import re
+import json
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
@@ -28,7 +29,8 @@ TZ = ZoneInfo("Asia/Tokyo")
 SENDAI_LAT = 38.2682
 SENDAI_LON = 140.8694
 
-POST_HOUR = 6
+POST_HOUR = int(os.getenv("POST_HOUR", "6"))        # 毎朝6時台に投稿
+POST_WINDOW_MIN = int(os.getenv("POST_WINDOW_MIN", "10"))  # 6:00〜6:09 の「9分間」みたいな窓
 
 # 文字数
 MAX_TOTAL_LEN = 210
@@ -37,6 +39,9 @@ SINGLE_LIMIT = 130  # これ超えたらツリー
 # Gemini
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 GEMINI_TEMP = float(os.getenv("GEMINI_TEMP", "0.6"))
+
+# 再起動対策（同日2回投稿防止）
+STATE_PATH = os.getenv("PRESSURE_STATE_PATH", "pressure_state.json")
 
 # =========================
 # クライアント
@@ -50,6 +55,65 @@ x_client = tweepy.Client(
 )
 
 gen_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# =========================
+# 時刻ユーティリティ / 状態保存
+# =========================
+def now_jst() -> datetime:
+    return datetime.now(TZ)
+
+def load_state() -> dict:
+    if not os.path.exists(STATE_PATH):
+        return {"last_post_date": None}
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"last_post_date": None}
+
+def save_state(state: dict) -> None:
+    try:
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def get_last_post_date():
+    st = load_state()
+    v = st.get("last_post_date")
+    if not v:
+        return None
+    try:
+        return datetime.fromisoformat(v).date()
+    except Exception:
+        return None
+
+def set_last_post_date(d):
+    st = load_state()
+    st["last_post_date"] = datetime.combine(d, dtime(0, 0), TZ).isoformat()
+    st["updated_at"] = now_jst().isoformat(timespec="seconds")
+    save_state(st)
+
+def next_post_datetime(ref: datetime) -> datetime:
+    """
+    「次に投稿するべき基準時刻（JST）」を返す。
+    すでに今日の投稿窓を過ぎていれば明日に回す。
+    """
+    today = ref.date()
+    start = datetime.combine(today, dtime(POST_HOUR, 0), TZ)
+    end = start + timedelta(minutes=POST_WINDOW_MIN)
+
+    if ref < end:
+        return start
+    # 窓を過ぎたら次は明日
+    tomorrow = today + timedelta(days=1)
+    return datetime.combine(tomorrow, dtime(POST_HOUR, 0), TZ)
+
+def in_post_window(ref: datetime) -> bool:
+    today = ref.date()
+    start = datetime.combine(today, dtime(POST_HOUR, 0), TZ)
+    end = start + timedelta(minutes=POST_WINDOW_MIN)
+    return start <= ref < end
 
 # =========================
 # Open-Meteo取得
@@ -79,23 +143,17 @@ def fetch_weather():
 # 天気マーク（1日の変化に強く：最悪を採用）
 # =========================
 def code_to_emoji(code: int) -> str:
-    # Snow
     if 71 <= code <= 77:
         return "❄️"
-    # Rain
     if 51 <= code <= 67:
         return "☔"
-    # Clear
     if code == 0:
         return "☀️"
-    # Partly cloudy
     if 1 <= code <= 3:
         return "🌤"
-    # Others
     return "🌥"
 
 def emoji_for_day(code12: int, code18: int, code24: int) -> str:
-    # 荒れ度の優先順位：雪 > 雨 > くもり系 > 晴れ
     def severity(code: int) -> int:
         if 71 <= code <= 77:
             return 3
@@ -118,8 +176,6 @@ def trend_label(base: int, p12: int, p18: int, p24: int) -> str:
     diffs = [p12 - base, p18 - base, p24 - base]
     worst = min(diffs)
     total = p24 - base
-
-    # 「急降下」より強い言葉は避けたいならこの3段階が安定
     if worst <= -3:
         return "やや不安定"
     if total <= -2:
@@ -130,10 +186,6 @@ def trend_label(base: int, p12: int, p18: int, p24: int) -> str:
 # Gemini：本文だけ生成（冒頭固定は触らせない）
 # =========================
 def gemini_body(material: dict) -> str:
-    """
-    material には数値などを全部渡す。
-    返すのは「本文（朝6時基準の行より下）」だけ。
-    """
     prompt = f"""
 あなたは整体師の視点で、仙台向け「気圧痛予報」の本文だけを書きます。
 次の固定部分（タイトル〜基準気圧）には触れません。繰り返しません。
@@ -184,7 +236,7 @@ def split_thread(text: str):
 # 投稿文生成（固定ヘッダ + Gemini本文）
 # =========================
 def build_post(material: dict) -> str:
-    today_str = datetime.now(TZ).strftime("%m月%d日")
+    today_str = now_jst().strftime("%m月%d日")
 
     head = (
         f"【仙台｜低気圧頭痛・気圧痛予報】{today_str}\n"
@@ -194,7 +246,6 @@ def build_post(material: dict) -> str:
     )
 
     body = gemini_body(material)
-
     full = (head + "\n" + body).strip()
 
     if len(full) > MAX_TOTAL_LEN:
@@ -206,7 +257,7 @@ def build_post(material: dict) -> str:
 # 投稿処理
 # =========================
 def post_forecast():
-    now = datetime.now(TZ)
+    now = now_jst()
     today = now.date()
 
     times, pressures, temps, hums, codes = fetch_weather()
@@ -241,9 +292,7 @@ def post_forecast():
     base = int(round(base_p))
 
     material = {
-        "h12": h12,
-        "h18": h18,
-        "h24": h24,
+        "h12": h12, "h18": h18, "h24": h24,
         "d12": int(round(d12["pressure"] - base_p)),
         "d18": int(round(d18["pressure"] - base_p)),
         "d24": int(round(d24["pressure"] - base_p)),
@@ -272,31 +321,51 @@ def post_forecast():
         first = x_client.create_tweet(text=parts[0])
         last_id = first.data["id"]
 
-        if len(parts) > 1:
+        if len(parts) > 1 and parts[1]:
             x_client.create_tweet(text=parts[1], in_reply_to_tweet_id=last_id)
 
-        print("投稿完了")
+        set_last_post_date(today)
+        print(f"[{now_jst().isoformat(timespec='seconds')}] ✅ 投稿完了（{len(parts)}ツリー）")
+
     except Exception as e:
-        print("投稿エラー:", e)
+        print(f"[{now_jst().isoformat(timespec='seconds')}] ❌ 投稿エラー: {e}")
 
 # =========================
 # 常駐
 # =========================
 def run_bot():
-    last_post_date = None
     print("気圧痛予報BOT 起動")
+    now = now_jst()
+    print(f"TZ: {TZ} / 現在JST: {now.isoformat(timespec='seconds')}")
+    print(f"POST_HOUR: {POST_HOUR} / WINDOW: {POST_WINDOW_MIN}分 / DEPLOY_RUN: {DEPLOY_RUN}")
+    print(f"次の投稿基準時刻(JST): {next_post_datetime(now).isoformat(timespec='seconds')}")
+    print(f"前回投稿日: {get_last_post_date()} / STATE_PATH: {STATE_PATH}")
 
+    # デプロイ即時投稿（任意）
     if DEPLOY_RUN:
-        print("デプロイ即時投稿")
-        post_forecast()
-        last_post_date = datetime.now(TZ).date()
+        today = now.date()
+        last = get_last_post_date()
+        if last == today:
+            print("デプロイ即時投稿スキップ（本日すでに投稿済み）")
+        else:
+            print("デプロイ即時投稿")
+            post_forecast()
 
+    # 常駐ループ
     while True:
-        now = datetime.now(TZ)
-        if now.hour == POST_HOUR and now.minute < 10:
-            if last_post_date != now.date():
-                post_forecast()
-                last_post_date = now.date()
+        now = now_jst()
+        today = now.date()
+        last = get_last_post_date()
+
+        # 投稿窓に入ったら、その日1回だけ
+        if in_post_window(now) and last != today:
+            print(f"[{now.isoformat(timespec='seconds')}] 投稿窓に入りました → 投稿します")
+            post_forecast()
+
+        # ログを見やすく：次の投稿予定をたまに出す（1時間に1回くらい）
+        if now.minute == 0 and now.second < 30:
+            print(f"[{now.isoformat(timespec='seconds')}] 次の投稿基準時刻(JST): {next_post_datetime(now).isoformat(timespec='seconds')}")
+
         time.sleep(30)
 
 if __name__ == "__main__":
