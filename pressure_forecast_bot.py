@@ -170,10 +170,13 @@ def post_forecast():
 
     base_p = tmap.get(base_dt, list(tmap.values())[0])["pressure"]
 
-    def get_data(h):
-        dt = datetime.combine(today, dtime(h,0), TZ)
-        return tmap.get(dt, list(tmap.values())[0])
-
+  　def get_data(hour):
+    # 24時は翌日の0時として扱う
+    if hour == 24:
+        dt = datetime.combine(today + timedelta(days=1), dtime(0, 0), TZ)
+    else:
+        dt = datetime.combine(today, dtime(hour, 0), TZ)
+    return tmap.get(dt, list(tmap.values())[0])
     d12 = get_data(12)
     d18 = get_data(18)
     d24 = get_data(24)
