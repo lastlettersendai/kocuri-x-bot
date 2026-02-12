@@ -27,10 +27,10 @@ TZ = ZoneInfo("Asia/Tokyo")
 SENDAI_LAT = 38.2682
 SENDAI_LON = 140.8694
 
-DROP_PER_HOUR_THRESHOLD = -1.5
-POST_HOUR = 6
+DROP_PER_HOUR_THRESHOLD = -1.5   # 1時間で -1.5hPa以下を急降下扱い
+POST_HOUR = 6                    # 毎朝6時台に投稿
 
-OPENAI_MODEL = "gpt-5"
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 MAX_LEN = 135
 
 # =========================
@@ -47,7 +47,7 @@ x_client = tweepy.Client(
 oa_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =========================
-# 気象データ取得（拡張）
+# 気象データ取得（Open-Meteo）
 # =========================
 def fetch_weather():
     url = (
@@ -71,30 +71,29 @@ def fetch_weather():
     )
 
 # =========================
-# 急降下検出
+# 急降下検出（1時間差）
 # =========================
 def find_drop_band(times_dt, pressures):
     worst = None
-    for i in range(len(pressures)-1):
-        diff = pressures[i+1] - pressures[i]
+    for i in range(len(pressures) - 1):
+        diff = pressures[i + 1] - pressures[i]
         if diff <= DROP_PER_HOUR_THRESHOLD:
             start = times_dt[i]
-            end = times_dt[i+1]
-            total = pressures[i+1] - pressures[i]
-            if not worst or total < worst[2]:
+            end = times_dt[i + 1]
+            total = pressures[i + 1] - pressures[i]
+            if (worst is None) or (total < worst[2]):
                 worst = (start, end, total)
     return worst
 
 # =========================
-# 空気感判定（気温基準で雪防止）
+# 空気感判定（気温基準で雪誤爆を防止）
 # =========================
 def weather_impression(code, temp, humidity):
-    # 雪系
+    # 雪系（気温<=3℃のときだけ雪/みぞれ）
     if 71 <= code <= 77:
         if temp <= 3:
             return "雪やみぞれの可能性も。"
-        else:
-            return "冷たい雨になりそう。"
+        return "冷たい雨になりそう。"
 
     # 雨系
     if 51 <= code <= 67:
@@ -115,7 +114,7 @@ def weather_impression(code, temp, humidity):
     return "落ち着いた空気の一日。"
 
 # =========================
-# 投稿文生成
+# 投稿文生成（ChatGPT）
 # =========================
 SYSTEM_PROMPT = """
 あなたは仙台在住者向けの低気圧頭痛・気圧痛予報を作る専門家です。
@@ -123,27 +122,26 @@ SYSTEM_PROMPT = """
 条件：
 ・1行目固定：【仙台｜低気圧頭痛・気圧痛予報】
 ・2行目固定：おはようございます。本日の気圧痛予報です。
-・12時、18時、24時の気圧を
-  「12時1010hPa(-1)｜18時1010hPa(-1)｜24時1010hPa(-1)」形式で1行に
+・12時、18時、24時の気圧を「12時1010hPa(-1)｜18時1010hPa(-1)｜24時1010hPa(-1)」形式で1行に
 ・朝6時の基準気圧を明記
 ・全体傾向を簡潔に説明
 ・weather_commentを自然に本文へ入れる
 ・怖がらせない
 ・生活指導は書かない
 ・最後はやさしく締める
-・135文字以内
+・135文字以内（絶対）
 ・完成文のみ出力
-"""
+""".strip()
 
-def generate_post(material):
-    response = oa_client.responses.create(
+def generate_post(material: dict) -> str:
+    resp = oa_client.responses.create(
         model=OPENAI_MODEL,
         instructions=SYSTEM_PROMPT,
         input=json.dumps(material, ensure_ascii=False)
     )
-    text = response.output_text.strip()
+    text = (resp.output_text or "").strip()
     if len(text) > MAX_LEN:
-        text = text[:MAX_LEN]
+        text = text[:MAX_LEN].rstrip()
     return text
 
 # =========================
@@ -153,46 +151,68 @@ def post_forecast():
     now = datetime.now(TZ)
     times, pressures, temps, hums, codes = fetch_weather()
 
+    # 文字列→datetime（JSTとして扱う）
     times_dt = [datetime.fromisoformat(t).replace(tzinfo=TZ) for t in times]
-    pressures = [float(p) for p in pressures]
+    pressures_f = [float(p) for p in pressures]
+    temps_f = [float(x) for x in temps]
+    hums_f = [float(x) for x in hums]
+    codes_i = [int(x) for x in codes]
 
     today = now.date()
-    base_dt = datetime.combine(today, dtime(6,0), TZ)
-    tmap = {
-        datetime.fromisoformat(t).replace(tzinfo=TZ): {
-            "pressure": float(p),
-            "temp": float(tmp),
-            "hum": float(h),
-            "code": int(c)
-        }
-        for t,p,tmp,h,c in zip(times, pressures, temps, hums, codes)
-    }
 
-    base_p = tmap.get(base_dt, list(tmap.values())[0])["pressure"]
+    # tmap（datetimeキー）
+    tmap = {}
+    for tdt, p, tmp, h, c in zip(times_dt, pressures_f, temps_f, hums_f, codes_i):
+        tmap[tdt] = {"pressure": p, "temp": tmp, "hum": h, "code": c}
 
-    def get_data(hour):
-    if hour == 24:
-        dt = datetime.combine(today + timedelta(days=1), dtime(0, 0), TZ)
-    else:
-        dt = datetime.combine(today, dtime(hour, 0), TZ)
-    return tmap.get(dt, list(tmap.values())[0])
+    # 朝6時の基準（なければ直近の先頭）
+    base_dt = datetime.combine(today, dtime(6, 0), TZ)
+    base_p = tmap.get(base_dt, next(iter(tmap.values())))["pressure"]
+
+    def get_data(hour: int):
+        # 24時 = 翌日の0時
+        if hour == 24:
+            dt = datetime.combine(today + timedelta(days=1), dtime(0, 0), TZ)
+        else:
+            dt = datetime.combine(today, dtime(hour, 0), TZ)
+
+        # ぴったりが無い場合の保険：最も近い時刻を探す（±2時間以内で）
+        if dt in tmap:
+            return tmap[dt]
+
+        nearest = None
+        best = None
+        for k in tmap.keys():
+            diff = abs((k - dt).total_seconds())
+            if (best is None) or (diff < best):
+                best = diff
+                nearest = k
+
+        return tmap[nearest]
+
     d12 = get_data(12)
     d18 = get_data(18)
     d24 = get_data(24)
 
-    band = find_drop_band(times_dt, pressures)
+    band = find_drop_band(times_dt, pressures_f)
 
-    weather_comment = weather_impression(
-        d12["code"], d12["temp"], d12["hum"]
-    )
+    weather_comment = weather_impression(d12["code"], d12["temp"], d12["hum"])
+
+    # 差分（朝6時基準）
+    def diff_str(v):
+        d = int(round(v - base_p))
+        return f"{d:+d}".replace("+", "+").replace("-", "-")
 
     material = {
-        "h12": round(d12["pressure"]),
-        "h18": round(d18["pressure"]),
-        "h24": round(d24["pressure"]),
-        "base": round(base_p),
+        "h12": int(round(d12["pressure"])),
+        "h18": int(round(d18["pressure"])),
+        "h24": int(round(d24["pressure"])),
+        "d12": int(round(d12["pressure"] - base_p)),
+        "d18": int(round(d18["pressure"] - base_p)),
+        "d24": int(round(d24["pressure"] - base_p)),
+        "base": int(round(base_p)),
         "has_drop": bool(band),
-        "drop_diff": round(band[2]) if band else None,
+        "drop_diff": int(round(band[2])) if band else None,
         "weather_comment": weather_comment
     }
 
@@ -218,10 +238,13 @@ def run_bot():
 
     while True:
         now = datetime.now(TZ)
+
+        # 6:00〜6:09の間に1回だけ
         if now.hour == POST_HOUR and now.minute < 10:
             if last_post_date != now.date():
                 post_forecast()
                 last_post_date = now.date()
+
         time.sleep(30)
 
 if __name__ == "__main__":
