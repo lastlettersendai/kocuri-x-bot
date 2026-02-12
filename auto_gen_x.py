@@ -5,6 +5,7 @@ import schedule
 import tweepy
 import requests
 import re
+import json
 from datetime import datetime
 import warnings
 
@@ -22,16 +23,60 @@ MAX_TOTAL_CHARS = TWEET_LIMIT * MAX_TWEETS_IN_THREAD  # 260
 
 POST_TIMES = ["07:30", "12:30", "18:30", "21:30"]
 
+# 視点ローテーション
+VIEWPOINTS = ["安心", "反論", "暴露", "解説"]
+HISTORY_PATH = "post_history.json"
+
 # =========================
-# Gemini：ほぼ自由に下書き
+# 視点履歴
 # =========================
-def gemini_draft(gemini_client) -> str:
+def load_history():
+    if not os.path.exists(HISTORY_PATH):
+        return {"last_viewpoint": -1}
+    try:
+        with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"last_viewpoint": -1}
+
+def save_history(data):
+    try:
+        with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def next_viewpoint():
+    h = load_history()
+    last = int(h.get("last_viewpoint", -1))
+    idx = (last + 1) % len(VIEWPOINTS)
+    vp = VIEWPOINTS[idx]
+    h["last_viewpoint"] = idx
+    h["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    save_history(h)
+    return vp
+
+# =========================
+# Gemini：ほぼ自由に下書き（視点だけ指定）
+# =========================
+def gemini_draft(gemini_client, viewpoint: str) -> str:
+    viewpoint_rule = {
+        "安心": "安心させる視点。敵ではない/守りの反応/余白。結論は静かに。",
+        "反論": "誤解への反論の視点。性格のせい・根性論をやさしく否定し、身体の反応に戻す。",
+        "暴露": "図星を言う視点。ちゃんとしすぎ/我慢/力みを言語化して、責めずに救う。",
+        "解説": "現象解説の視点。首・喉・呼吸・みぞおち等の具体→日常場面→『切り替え』の話へ。"
+    }[viewpoint]
+
     prompt = f"""
 あなたは「整体院コクリ」院長のナベジュン。
 パニック障害と聴覚障害の当事者経験を背景に、
 自律神経の不調や過緊張を“身体の反応”として扱う整体師です。
 
-X投稿の下書きを1本、自由に書いてください。
+今回はの視点で、X投稿の下書きを1本書いてください。
+文章構造は自由。短文を散らしすぎなくてOK。語る感じでもOK。
+
+【今回の視点メモ】
+{viewpoint_rule}
 
 【ナベジュン憲法（必ず守る）】
 ・症状は敵ではなく、まず守りの反応として扱う
@@ -47,6 +92,7 @@ X投稿の下書きを1本、自由に書いてください。
 ・売り込み禁止（予約/来院/価格/プロフィール誘導など禁止）
 ・最大{MAX_TOTAL_CHARS}文字以内（短いのはOK）
 """.strip()
+
     r = gemini_client.models.generate_content(
         model="gemini-3-flash-preview",
         contents=prompt,
@@ -166,7 +212,10 @@ def job():
     try:
         gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-        draft = gemini_draft(gemini_client)
+        viewpoint = next_viewpoint()
+        print(f"【今回の視点】{viewpoint}")
+
+        draft = gemini_draft(gemini_client, viewpoint=viewpoint)
         final = chatgpt_polish(draft)
         final = remove_consecutive_duplicate_lines(final)
 
@@ -205,9 +254,8 @@ def job():
 for t in POST_TIMES:
     schedule.every().day.at(t).do(job)
 
-print(f"2ツリー固定 起動完了（1日{len(POST_TIMES)}回 / 130字×最大2）")
+print(f"2ツリー固定×視点ローテ 起動完了（1日{len(POST_TIMES)}回 / 130字×最大2 / 4視点）")
 
-# デプロイ時に1回実行したくない場合は下の1行をコメントアウト
 job()
 
 while True:
