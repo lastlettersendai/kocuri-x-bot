@@ -11,6 +11,11 @@ from google import genai
 from google.genai import types
 
 # =========================
+# パス基準（Railway等での相対パス事故防止）
+# =========================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# =========================
 # 環境変数
 # =========================
 X_API_KEY = os.getenv("API_KEY")
@@ -23,7 +28,9 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DEPLOY_RUN = (os.getenv("DEPLOY_RUN", "0") == "1")
 
 # 画像バナー（固定 or 自動生成で上書きするファイル）
-BANNER_PATH = os.getenv("PRESSURE_BANNER_PATH", "pressurex.jpg")
+# 例：GitHub直下に pressurex.jpg を置く
+BANNER_NAME = os.getenv("PRESSURE_BANNER_PATH", "pressurex.jpg")
+BANNER_PATH = os.path.join(BASE_DIR, BANNER_NAME)
 
 # =========================
 # 設定
@@ -35,7 +42,8 @@ SENDAI_LON = 140.8694
 POST_HOUR = int(os.getenv("POST_HOUR", "6"))
 POST_WINDOW_MIN = int(os.getenv("POST_WINDOW_MIN", "10"))
 
-MAX_TOTAL_LEN = 210
+# ★重要：途中で強制カットすると文が途切れるので使わない（分割はsplit_threadに任せる）
+# MAX_TOTAL_LEN = 210
 SINGLE_LIMIT = 130
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
@@ -224,10 +232,8 @@ def build_post(material):
     body = gemini_body(material)
     full = head + "\n\n" + body
 
-    if len(full) > MAX_TOTAL_LEN:
-        full = full[:MAX_TOTAL_LEN].rstrip()
-
-    return full
+    # ★ここでの強制カットはしない（文が途中で切れるため）
+    return full.strip()
 
 # =========================
 # 投稿処理
@@ -262,8 +268,6 @@ def post_forecast():
     d18 = get_data(18)
     d24 = get_data(24)
 
-    base = int(round(base_p))
-
     material = {
         "h12": int(round(d12["pressure"])),
         "h18": int(round(d18["pressure"])),
@@ -273,7 +277,7 @@ def post_forecast():
         "d18": int(round(d18["pressure"] - base_p)),
         "d24": int(round(d24["pressure"] - base_p)),
 
-        "base": base,
+        "base": int(round(base_p)),
 
         "hum12": int(round(d12["hum"])),
         "hum18": int(round(d18["hum"])),
@@ -288,17 +292,31 @@ def post_forecast():
     parts = split_thread(post_text)
 
     # =========================
+    # DEBUG（ログに必ず出す）
+    # =========================
+    print("=== DEBUG ===")
+    print("Using banner:", BANNER_PATH)
+    print("Exists:", os.path.exists(BANNER_PATH))
+    print("Parts count:", len(parts))
+    print("Part1 len:", len(parts[0]) if parts else 0)
+    if len(parts) > 1:
+        print("Part2 len:", len(parts[1]))
+    print("=============")
+
+    # =========================
     # 画像アップロード（最初のツイートだけに付与）
     # =========================
     media_id = None
-    if BANNER_PATH and os.path.exists(BANNER_PATH):
-        try:
+    try:
+        if os.path.exists(BANNER_PATH):
             media = x_api_v1.media_upload(BANNER_PATH)
-            media_id = media.media_id
-        except Exception as e:
-            print(f"画像アップロード失敗（画像なしで投稿します）: {e}")
-    else:
-        print(f"バナー画像が見つかりません: {BANNER_PATH}（画像なしで投稿します）")
+            media_id = getattr(media, "media_id_string", None) or str(media.media_id)
+            print("uploaded media_id:", media_id)
+        else:
+            print("banner NOT FOUND")
+    except Exception as e:
+        print("media_upload ERROR:", e)
+        media_id = None
 
     # =========================
     # 投稿（ツリー対応）
@@ -310,7 +328,6 @@ def post_forecast():
 
     parent_id = first.data["id"]
 
-    # 2ツイート目以降
     for p in parts[1:]:
         res = x_client.create_tweet(text=p, in_reply_to_tweet_id=parent_id)
         parent_id = res.data["id"]
