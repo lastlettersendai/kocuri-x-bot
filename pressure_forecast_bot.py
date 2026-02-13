@@ -28,7 +28,6 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DEPLOY_RUN = (os.getenv("DEPLOY_RUN", "0") == "1")
 
 # 画像バナー（固定 or 自動生成で上書きするファイル）
-# 例：GitHub直下に pressurex.jpg を置く
 BANNER_NAME = os.getenv("PRESSURE_BANNER_PATH", "pressurex.jpg")
 BANNER_PATH = os.path.join(BASE_DIR, BANNER_NAME)
 
@@ -42,9 +41,8 @@ SENDAI_LON = 140.8694
 POST_HOUR = int(os.getenv("POST_HOUR", "6"))
 POST_WINDOW_MIN = int(os.getenv("POST_WINDOW_MIN", "10"))
 
-# ★重要：途中で強制カットすると文が途切れるので使わない（分割はsplit_threadに任せる）
-# MAX_TOTAL_LEN = 210
-SINGLE_LIMIT = 130
+# Xの上限は280だけど、安全に260で切る（URLなどの揺れ対策）
+TWEET_LIMIT = 260
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 GEMINI_TEMP = float(os.getenv("GEMINI_TEMP", "0.6"))
@@ -54,7 +52,6 @@ STATE_PATH = os.getenv("PRESSURE_STATE_PATH", "pressure_state.json")
 # =========================
 # クライアント
 # =========================
-# 投稿（v2）
 x_client = tweepy.Client(
     bearer_token=X_BEARER_TOKEN,
     consumer_key=X_API_KEY,
@@ -63,7 +60,6 @@ x_client = tweepy.Client(
     access_token_secret=X_ACCESS_SECRET
 )
 
-# 画像アップロード（v1.1）
 x_api_v1 = tweepy.API(
     tweepy.OAuth1UserHandler(
         X_API_KEY,
@@ -162,17 +158,17 @@ def code_to_emoji(code):
 def gemini_body(material):
     prompt = f"""
 あなたは整体師。
-仙台向け気圧痛予報の本文だけを書いてください。
+仙台向け気圧痛予報の「本文だけ」を書いてください。
 
 【条件】
-・2〜3文
+・2〜3文（必ず「。」で文を終える）
 ・湿度による体感を必ず1文入れる
 ・怖がらせない
 ・生活指導しない
 ・宣伝しない
 ・やさしく締める
 ・本文のみ出力
-・100文字前後
+・100〜140文字程度（長くしすぎない）
 
 湿度:
 12時{material["hum12"]}% / 18時{material["hum18"]}% / 24時{material["hum24"]}%
@@ -187,39 +183,46 @@ def gemini_body(material):
     return (r.text or "").strip()
 
 # =========================
-# 改行優先ツリー分割（複数対応）
+# 文章を文末優先で分割（260文字）
 # =========================
-def split_thread(text):
+def split_by_sentence(text, limit=TWEET_LIMIT):
+    text = (text or "").strip()
+    if not text:
+        return []
+
     parts = []
-    rest = text.strip()
+    rest = text
 
     while rest:
-        if len(rest) <= SINGLE_LIMIT:
+        if len(rest) <= limit:
             parts.append(rest)
             break
 
-        window = rest[:SINGLE_LIMIT]
-        cut = window.rfind("\n")
+        window = rest[:limit]
 
+        # 優先: 改行 > 句点 > 感嘆/疑問 > 読点
+        cut = max(
+            window.rfind("\n"),
+            window.rfind("。"),
+            window.rfind("！"),
+            window.rfind("？"),
+            window.rfind("、"),
+        )
+
+        # さすがに短すぎる切り方は避ける
         if cut < 60:
-            cut = -1
-            for m in re.finditer(r"[。！？]", window):
-                cut = m.end()
+            cut = limit
 
-        if cut < 60:
-            cut = SINGLE_LIMIT
+        parts.append(rest[:cut + (1 if cut != limit else 0)].strip())
+        rest = rest[cut + (1 if cut != limit else 0):].strip()
 
-        parts.append(rest[:cut].strip())
-        rest = rest[cut:].strip()
-
-    return parts
+    return [p for p in parts if p]
 
 # =========================
-# 投稿文生成
+# 投稿文生成（headとbodyを分ける）
 # =========================
-def build_post(material):
+def build_head(material):
     today_str = now_jst().strftime("%m月%d日")
-
     head = (
         f"【仙台｜低気圧頭痛・気圧痛予報】{today_str}\n"
         f"おはようございます。整体院コクリの今日の気圧痛予報です {material['emoji']}\n\n"
@@ -228,12 +231,7 @@ def build_post(material):
         f"・24時{material['h24']}hPa({material['d24']:+d})\n"
         f"（朝6時の基準は{material['base']}hPa）"
     )
-
-    body = gemini_body(material)
-    full = head + "\n\n" + body
-
-    # ★ここでの強制カットはしない（文が途中で切れるため）
-    return full.strip()
+    return head.strip()
 
 # =========================
 # 投稿処理
@@ -288,8 +286,11 @@ def post_forecast():
 
     material["emoji"] = code_to_emoji(d12["code"])
 
-    post_text = build_post(material)
-    parts = split_thread(post_text)
+    head = build_head(material)
+    body = gemini_body(material)
+
+    # 本文が長い日だけ分割（基本は1本）
+    body_parts = split_by_sentence(body, TWEET_LIMIT)
 
     # =========================
     # DEBUG（ログに必ず出す）
@@ -297,14 +298,13 @@ def post_forecast():
     print("=== DEBUG ===")
     print("Using banner:", BANNER_PATH)
     print("Exists:", os.path.exists(BANNER_PATH))
-    print("Parts count:", len(parts))
-    print("Part1 len:", len(parts[0]) if parts else 0)
-    if len(parts) > 1:
-        print("Part2 len:", len(parts[1]))
+    print("Head len:", len(head))
+    print("Body len:", len(body))
+    print("Body parts:", len(body_parts))
     print("=============")
 
     # =========================
-    # 画像アップロード（最初のツイートだけに付与）
+    # 画像アップロード（最初のツイートだけ）
     # =========================
     media_id = None
     try:
@@ -319,16 +319,17 @@ def post_forecast():
         media_id = None
 
     # =========================
-    # 投稿（ツリー対応）
+    # 投稿（ツリー）
     # =========================
     if media_id:
-        first = x_client.create_tweet(text=parts[0], media_ids=[media_id])
+        first = x_client.create_tweet(text=head, media_ids=[media_id])
     else:
-        first = x_client.create_tweet(text=parts[0])
+        first = x_client.create_tweet(text=head)
 
     parent_id = first.data["id"]
 
-    for p in parts[1:]:
+    # 2ツイ目：本文（1〜n本）
+    for p in body_parts:
         res = x_client.create_tweet(text=p, in_reply_to_tweet_id=parent_id)
         parent_id = res.data["id"]
 
