@@ -29,18 +29,15 @@ TZ = ZoneInfo("Asia/Tokyo")
 SENDAI_LAT = 38.2682
 SENDAI_LON = 140.8694
 
-POST_HOUR = int(os.getenv("POST_HOUR", "6"))        # 毎朝6時台に投稿
-POST_WINDOW_MIN = int(os.getenv("POST_WINDOW_MIN", "10"))  # 6:00〜6:09 の「9分間」みたいな窓
+POST_HOUR = int(os.getenv("POST_HOUR", "6"))
+POST_WINDOW_MIN = int(os.getenv("POST_WINDOW_MIN", "10"))
 
-# 文字数
 MAX_TOTAL_LEN = 210
-SINGLE_LIMIT = 130  # これ超えたらツリー
+SINGLE_LIMIT = 130
 
-# Gemini
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 GEMINI_TEMP = float(os.getenv("GEMINI_TEMP", "0.6"))
 
-# 再起動対策（同日2回投稿防止）
 STATE_PATH = os.getenv("PRESSURE_STATE_PATH", "pressure_state.json")
 
 # =========================
@@ -57,12 +54,12 @@ x_client = tweepy.Client(
 gen_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # =========================
-# 時刻ユーティリティ / 状態保存
+# 時刻関連
 # =========================
-def now_jst() -> datetime:
+def now_jst():
     return datetime.now(TZ)
 
-def load_state() -> dict:
+def load_state():
     if not os.path.exists(STATE_PATH):
         return {"last_post_date": None}
     try:
@@ -71,7 +68,7 @@ def load_state() -> dict:
     except Exception:
         return {"last_post_date": None}
 
-def save_state(state: dict) -> None:
+def save_state(state):
     try:
         with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
@@ -91,32 +88,16 @@ def get_last_post_date():
 def set_last_post_date(d):
     st = load_state()
     st["last_post_date"] = datetime.combine(d, dtime(0, 0), TZ).isoformat()
-    st["updated_at"] = now_jst().isoformat(timespec="seconds")
     save_state(st)
 
-def next_post_datetime(ref: datetime) -> datetime:
-    """
-    「次に投稿するべき基準時刻（JST）」を返す。
-    すでに今日の投稿窓を過ぎていれば明日に回す。
-    """
-    today = ref.date()
-    start = datetime.combine(today, dtime(POST_HOUR, 0), TZ)
-    end = start + timedelta(minutes=POST_WINDOW_MIN)
-
-    if ref < end:
-        return start
-    # 窓を過ぎたら次は明日
-    tomorrow = today + timedelta(days=1)
-    return datetime.combine(tomorrow, dtime(POST_HOUR, 0), TZ)
-
-def in_post_window(ref: datetime) -> bool:
+def in_post_window(ref):
     today = ref.date()
     start = datetime.combine(today, dtime(POST_HOUR, 0), TZ)
     end = start + timedelta(minutes=POST_WINDOW_MIN)
     return start <= ref < end
 
 # =========================
-# Open-Meteo取得
+# 天気取得
 # =========================
 def fetch_weather():
     url = (
@@ -140,9 +121,9 @@ def fetch_weather():
     )
 
 # =========================
-# 天気マーク（1日の変化に強く：最悪を採用）
+# 天気マーク
 # =========================
-def code_to_emoji(code: int) -> str:
+def code_to_emoji(code):
     if 71 <= code <= 77:
         return "❄️"
     if 51 <= code <= 67:
@@ -153,59 +134,27 @@ def code_to_emoji(code: int) -> str:
         return "🌤"
     return "🌥"
 
-def emoji_for_day(code12: int, code18: int, code24: int) -> str:
-    def severity(code: int) -> int:
-        if 71 <= code <= 77:
-            return 3
-        if 51 <= code <= 67:
-            return 2
-        if 1 <= code <= 3:
-            return 1
-        if code == 0:
-            return 0
-        return 1
-
-    codes = [code12, code18, code24]
-    worst = max(codes, key=severity)
-    return code_to_emoji(worst)
-
 # =========================
-# トレンド（簡易）
+# Gemini本文
 # =========================
-def trend_label(base: int, p12: int, p18: int, p24: int) -> str:
-    diffs = [p12 - base, p18 - base, p24 - base]
-    worst = min(diffs)
-    total = p24 - base
-    if worst <= -3:
-        return "やや不安定"
-    if total <= -2:
-        return "少し下がる"
-    return "安定"
-
-# =========================
-# Gemini：本文だけ生成（冒頭固定は触らせない）
-# =========================
-def gemini_body(material: dict) -> str:
+def gemini_body(material):
     prompt = f"""
-あなたは整体師の視点で、仙台向け「気圧痛予報」の本文だけを書きます。
-次の固定部分（タイトル〜基準気圧）には触れません。繰り返しません。
+あなたは整体師。
+仙台向け気圧痛予報の本文だけを書いてください。
 
-【必須】
-・本文は2〜3文
-・湿度の影響コメントを1文に必ず入れる（高湿度=重だるさ/むくみ感、低湿度=喉・呼吸の浅さ/張り詰め感、のように“体感”で）
-・怖がらせない／生活指導しない（ストレッチ、水分、入浴などの指示禁止）
-・宣伝しない（予約・来院誘導禁止）
+【条件】
+・2〜3文
+・湿度による体感を必ず1文入れる
+・怖がらせない
+・生活指導しない
+・宣伝しない
 ・やさしく締める
-・「箇条書き」「見出し」「番号」禁止
-・本文単体で80文字前後を目安（短めに）
+・本文のみ出力
+・100文字前後
 
-【今日の材料（機械データ）】
+湿度:
+12時{material["hum12"]}% / 18時{material["hum18"]}% / 24時{material["hum24"]}%
 傾向: {material["trend"]}
-湿度: 12時{material["hum12"]}% / 18時{material["hum18"]}% / 24時{material["hum24"]}%
-気温: 12時{material["temp12"]}℃ / 18時{material["temp18"]}℃ / 24時{material["temp24"]}℃
-空模様コード: 12時{material["code12"]} / 18時{material["code18"]} / 24時{material["code24"]}
-
-本文のみを出力してください。
 """.strip()
 
     r = gen_client.models.generate_content(
@@ -216,16 +165,20 @@ def gemini_body(material: dict) -> str:
     return (r.text or "").strip()
 
 # =========================
-# 句点優先ツリー分割（130）
+# 改行優先ツリー分割
 # =========================
-def split_thread(text: str):
+def split_thread(text):
     if len(text) <= SINGLE_LIMIT:
         return [text]
 
     window = text[:SINGLE_LIMIT]
-    cut = -1
-    for m in re.finditer(r"[。！？]", window):
-        cut = m.end()
+
+    cut = window.rfind("\n")
+
+    if cut < 60:
+        cut = -1
+        for m in re.finditer(r"[。！？]", window):
+            cut = m.end()
 
     if cut < 60:
         cut = SINGLE_LIMIT
@@ -233,20 +186,23 @@ def split_thread(text: str):
     return [text[:cut].strip(), text[cut:].strip()]
 
 # =========================
-# 投稿文生成（固定ヘッダ + Gemini本文）
+# 投稿文生成
 # =========================
-def build_post(material: dict) -> str:
+def build_post(material):
     today_str = now_jst().strftime("%m月%d日")
 
     head = (
         f"【仙台｜低気圧頭痛・気圧痛予報】{today_str}\n"
         f"おはようございます。整体院コクリの今日の気圧痛予報です {material['emoji']}\n\n"
-        f"12時{material['h12']}hPa({material['d12']:+d})｜18時{material['h18']}hPa({material['d18']:+d})｜24時{material['h24']}hPa({material['d24']:+d})\n"
-        f"朝6時の基準は{material['base']}hPa。\n"
+        f"・12時{material['h12']}hPa({material['d12']:+d})\n"
+        f"・18時{material['h18']}hPa({material['d18']:+d})\n"
+        f"・24時{material['h24']}hPa({material['d24']:+d})\n"
+        f"（朝6時の基準は{material['base']}hPa）"
     )
 
     body = gemini_body(material)
-    full = (head + "\n" + body).strip()
+
+    full = head + "\n\n" + body
 
     if len(full) > MAX_TOTAL_LEN:
         full = full[:MAX_TOTAL_LEN].rstrip()
@@ -261,8 +217,8 @@ def post_forecast():
     today = now.date()
 
     times, pressures, temps, hums, codes = fetch_weather()
-
     times_dt = [datetime.fromisoformat(t).replace(tzinfo=TZ) for t in times]
+
     tmap = {}
     for tdt, p, tmp, h, c in zip(times_dt, pressures, temps, hums, codes):
         tmap[tdt] = {
@@ -275,7 +231,7 @@ def post_forecast():
     base_dt = datetime.combine(today, dtime(6, 0), TZ)
     base_p = tmap.get(base_dt, next(iter(tmap.values())))["pressure"]
 
-    def get_data(hour: int):
+    def get_data(hour):
         if hour == 24:
             dt = datetime.combine(today + timedelta(days=1), dtime(0, 0), TZ)
         else:
@@ -286,86 +242,52 @@ def post_forecast():
     d18 = get_data(18)
     d24 = get_data(24)
 
-    h12 = int(round(d12["pressure"]))
-    h18 = int(round(d18["pressure"]))
-    h24 = int(round(d24["pressure"]))
     base = int(round(base_p))
 
     material = {
-        "h12": h12, "h18": h18, "h24": h24,
+        "h12": int(round(d12["pressure"])),
+        "h18": int(round(d18["pressure"])),
+        "h24": int(round(d24["pressure"])),
+
         "d12": int(round(d12["pressure"] - base_p)),
         "d18": int(round(d18["pressure"] - base_p)),
         "d24": int(round(d24["pressure"] - base_p)),
-        "base": base,
 
-        "temp12": int(round(d12["temp"])),
-        "temp18": int(round(d18["temp"])),
-        "temp24": int(round(d24["temp"])),
+        "base": base,
 
         "hum12": int(round(d12["hum"])),
         "hum18": int(round(d18["hum"])),
         "hum24": int(round(d24["hum"])),
 
-        "code12": int(d12["code"]),
-        "code18": int(d18["code"]),
-        "code24": int(d24["code"]),
+        "trend": "少し下がる" if d24["pressure"] - base_p <= -2 else "安定"
     }
 
-    material["emoji"] = emoji_for_day(material["code12"], material["code18"], material["code24"])
-    material["trend"] = trend_label(base, h12, h18, h24)
+    material["emoji"] = code_to_emoji(d12["code"])
 
     post_text = build_post(material)
     parts = split_thread(post_text)
 
-    try:
-        first = x_client.create_tweet(text=parts[0])
-        last_id = first.data["id"]
+    first = x_client.create_tweet(text=parts[0])
+    if len(parts) > 1:
+        x_client.create_tweet(text=parts[1], in_reply_to_tweet_id=first.data["id"])
 
-        if len(parts) > 1 and parts[1]:
-            x_client.create_tweet(text=parts[1], in_reply_to_tweet_id=last_id)
-
-        set_last_post_date(today)
-        print(f"[{now_jst().isoformat(timespec='seconds')}] ✅ 投稿完了（{len(parts)}ツリー）")
-
-    except Exception as e:
-        print(f"[{now_jst().isoformat(timespec='seconds')}] ❌ 投稿エラー: {e}")
+    set_last_post_date(today)
+    print("投稿完了")
 
 # =========================
 # 常駐
 # =========================
 def run_bot():
     print("気圧痛予報BOT 起動")
-    now = now_jst()
-    print(f"TZ: {TZ} / 現在JST: {now.isoformat(timespec='seconds')}")
-    print(f"POST_HOUR: {POST_HOUR} / WINDOW: {POST_WINDOW_MIN}分 / DEPLOY_RUN: {DEPLOY_RUN}")
-    print(f"次の投稿基準時刻(JST): {next_post_datetime(now).isoformat(timespec='seconds')}")
-    print(f"前回投稿日: {get_last_post_date()} / STATE_PATH: {STATE_PATH}")
 
-    # デプロイ即時投稿（任意）
     if DEPLOY_RUN:
-        today = now.date()
-        last = get_last_post_date()
-        if last == today:
-            print("デプロイ即時投稿スキップ（本日すでに投稿済み）")
-        else:
-            print("デプロイ即時投稿")
+        if get_last_post_date() != now_jst().date():
             post_forecast()
 
-    # 常駐ループ
     while True:
         now = now_jst()
-        today = now.date()
-        last = get_last_post_date()
-
-        # 投稿窓に入ったら、その日1回だけ
-        if in_post_window(now) and last != today:
-            print(f"[{now.isoformat(timespec='seconds')}] 投稿窓に入りました → 投稿します")
+        if in_post_window(now) and get_last_post_date() != now.date():
             post_forecast()
-
-        # ログを見やすく：次の投稿予定をたまに出す（1時間に1回くらい）
-        if now.minute == 0 and now.second < 30:
-            print(f"[{now.isoformat(timespec='seconds')}] 次の投稿基準時刻(JST): {next_post_datetime(now).isoformat(timespec='seconds')}")
-
         time.sleep(30)
 
 if __name__ == "__main__":
