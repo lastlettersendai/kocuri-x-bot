@@ -22,6 +22,9 @@ X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DEPLOY_RUN = (os.getenv("DEPLOY_RUN", "0") == "1")
 
+# 画像バナー（固定 or 自動生成で上書きするファイル）
+BANNER_PATH = os.getenv("PRESSURE_BANNER_PATH", "pressurex.jpg")
+
 # =========================
 # 設定
 # =========================
@@ -43,12 +46,23 @@ STATE_PATH = os.getenv("PRESSURE_STATE_PATH", "pressure_state.json")
 # =========================
 # クライアント
 # =========================
+# 投稿（v2）
 x_client = tweepy.Client(
     bearer_token=X_BEARER_TOKEN,
     consumer_key=X_API_KEY,
     consumer_secret=X_API_SECRET,
     access_token=X_ACCESS_TOKEN,
     access_token_secret=X_ACCESS_SECRET
+)
+
+# 画像アップロード（v1.1）
+x_api_v1 = tweepy.API(
+    tweepy.OAuth1UserHandler(
+        X_API_KEY,
+        X_API_SECRET,
+        X_ACCESS_TOKEN,
+        X_ACCESS_SECRET,
+    )
 )
 
 gen_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -165,25 +179,32 @@ def gemini_body(material):
     return (r.text or "").strip()
 
 # =========================
-# 改行優先ツリー分割
+# 改行優先ツリー分割（複数対応）
 # =========================
 def split_thread(text):
-    if len(text) <= SINGLE_LIMIT:
-        return [text]
+    parts = []
+    rest = text.strip()
 
-    window = text[:SINGLE_LIMIT]
+    while rest:
+        if len(rest) <= SINGLE_LIMIT:
+            parts.append(rest)
+            break
 
-    cut = window.rfind("\n")
+        window = rest[:SINGLE_LIMIT]
+        cut = window.rfind("\n")
 
-    if cut < 60:
-        cut = -1
-        for m in re.finditer(r"[。！？]", window):
-            cut = m.end()
+        if cut < 60:
+            cut = -1
+            for m in re.finditer(r"[。！？]", window):
+                cut = m.end()
 
-    if cut < 60:
-        cut = SINGLE_LIMIT
+        if cut < 60:
+            cut = SINGLE_LIMIT
 
-    return [text[:cut].strip(), text[cut:].strip()]
+        parts.append(rest[:cut].strip())
+        rest = rest[cut:].strip()
+
+    return parts
 
 # =========================
 # 投稿文生成
@@ -201,7 +222,6 @@ def build_post(material):
     )
 
     body = gemini_body(material)
-
     full = head + "\n\n" + body
 
     if len(full) > MAX_TOTAL_LEN:
@@ -267,9 +287,33 @@ def post_forecast():
     post_text = build_post(material)
     parts = split_thread(post_text)
 
-    first = x_client.create_tweet(text=parts[0])
-    if len(parts) > 1:
-        x_client.create_tweet(text=parts[1], in_reply_to_tweet_id=first.data["id"])
+    # =========================
+    # 画像アップロード（最初のツイートだけに付与）
+    # =========================
+    media_id = None
+    if BANNER_PATH and os.path.exists(BANNER_PATH):
+        try:
+            media = x_api_v1.media_upload(BANNER_PATH)
+            media_id = media.media_id
+        except Exception as e:
+            print(f"画像アップロード失敗（画像なしで投稿します）: {e}")
+    else:
+        print(f"バナー画像が見つかりません: {BANNER_PATH}（画像なしで投稿します）")
+
+    # =========================
+    # 投稿（ツリー対応）
+    # =========================
+    if media_id:
+        first = x_client.create_tweet(text=parts[0], media_ids=[media_id])
+    else:
+        first = x_client.create_tweet(text=parts[0])
+
+    parent_id = first.data["id"]
+
+    # 2ツイート目以降
+    for p in parts[1:]:
+        res = x_client.create_tweet(text=p, in_reply_to_tweet_id=parent_id)
+        parent_id = res.data["id"]
 
     set_last_post_date(today)
     print("投稿完了")
