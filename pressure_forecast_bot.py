@@ -232,7 +232,7 @@ def build_head(material):
         f"（朝6時の基準は{material['base']}hPa）"
     )
     return head.strip()
-
+FORCE_POST = (os.getenv("FORCE_POST", "0") == "1")
 # =========================
 # 投稿処理
 # =========================
@@ -341,6 +341,14 @@ def post_forecast():
 # =========================
 def run_bot():
     print("気圧痛予報BOT 起動")
+    print("NOW(JST):", now_jst().isoformat())
+    print("LAST_POST_DATE:", get_last_post_date())
+    print("DEPLOY_RUN:", DEPLOY_RUN)
+    print("FORCE_POST:", FORCE_POST)
+
+    if FORCE_POST:
+        post_forecast()
+        return
 
     if DEPLOY_RUN:
         if get_last_post_date() != now_jst().date():
@@ -348,7 +356,8 @@ def run_bot():
 
     while True:
         now = now_jst()
-        if in_post_window(now) and get_last_post_date() != now.date():
+        today = now.date()
+        if get_last_post_date() != today and now.hour >= POST_HOUR:
             post_forecast()
         time.sleep(30)
 
