@@ -262,27 +262,30 @@ def post_forecast():
             dt = datetime.combine(today, dtime(hour, 0), TZ)
         return tmap.get(dt, next(iter(tmap.values())))
 
-    d12 = get_data(12)
-    d18 = get_data(18)
-    d24 = get_data(24)
+    base_i = int(round(base_p))
+h12_i = int(round(d12["pressure"]))
+h18_i = int(round(d18["pressure"]))
+h24_i = int(round(d24["pressure"]))
 
-    material = {
-        "h12": int(round(d12["pressure"])),
-        "h18": int(round(d18["pressure"])),
-        "h24": int(round(d24["pressure"])),
+material = {
+    "h12": h12_i,
+    "h18": h18_i,
+    "h24": h24_i,
 
-        "d12": int(round(d12["pressure"] - base_p)),
-        "d18": int(round(d18["pressure"] - base_p)),
-        "d24": int(round(d24["pressure"] - base_p)),
+    # 差分は「表示値同士」で計算（ズレ防止）
+    "d12": h12_i - base_i,
+    "d18": h18_i - base_i,
+    "d24": h24_i - base_i,
 
-        "base": int(round(base_p)),
+    "base": base_i,
 
-        "hum12": int(round(d12["hum"])),
-        "hum18": int(round(d18["hum"])),
-        "hum24": int(round(d24["hum"])),
+    "hum12": int(round(d12["hum"])),
+    "hum18": int(round(d18["hum"])),
+    "hum24": int(round(d24["hum"])),
 
-        "trend": "少し下がる" if d24["pressure"] - base_p <= -2 else "安定"
-    }
+    # trend も表示と同じ整数差分で判断
+    "trend": "少し下がる" if (h24_i - base_i) <= -2 else "安定"
+}
 
     material["emoji"] = code_to_emoji(d12["code"])
 
