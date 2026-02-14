@@ -27,6 +27,9 @@ X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DEPLOY_RUN = (os.getenv("DEPLOY_RUN", "0") == "1")
 
+# テスト用（1回だけ強制投稿）
+FORCE_POST = (os.getenv("FORCE_POST", "0") == "1")
+
 # 画像バナー（固定 or 自動生成で上書きするファイル）
 BANNER_NAME = os.getenv("PRESSURE_BANNER_PATH", "pressurex.jpg")
 BANNER_PATH = os.path.join(BASE_DIR, BANNER_NAME)
@@ -52,6 +55,7 @@ STATE_PATH = os.getenv("PRESSURE_STATE_PATH", "pressure_state.json")
 # =========================
 # クライアント
 # =========================
+# 投稿（v2）
 x_client = tweepy.Client(
     bearer_token=X_BEARER_TOKEN,
     consumer_key=X_API_KEY,
@@ -60,6 +64,7 @@ x_client = tweepy.Client(
     access_token_secret=X_ACCESS_SECRET
 )
 
+# 画像アップロード（v1.1）
 x_api_v1 = tweepy.API(
     tweepy.OAuth1UserHandler(
         X_API_KEY,
@@ -200,7 +205,6 @@ def split_by_sentence(text, limit=TWEET_LIMIT):
 
         window = rest[:limit]
 
-        # 優先: 改行 > 句点 > 感嘆/疑問 > 読点
         cut = max(
             window.rfind("\n"),
             window.rfind("。"),
@@ -209,17 +213,18 @@ def split_by_sentence(text, limit=TWEET_LIMIT):
             window.rfind("、"),
         )
 
-        # さすがに短すぎる切り方は避ける
         if cut < 60:
             cut = limit
 
-        parts.append(rest[:cut + (1 if cut != limit else 0)].strip())
-        rest = rest[cut + (1 if cut != limit else 0):].strip()
+        take_len = cut + (1 if cut != limit else 0)
+        parts.append(rest[:take_len].strip())
+        rest = rest[take_len:].strip()
 
     return [p for p in parts if p]
 
 # =========================
 # 投稿文生成（headとbodyを分ける）
+# ※「続き誘導の文面」は入れない（画像側に入れる方針）
 # =========================
 def build_head(material):
     today_str = now_jst().strftime("%m月%d日")
@@ -232,7 +237,7 @@ def build_head(material):
         f"（朝6時の基準は{material['base']}hPa）"
     )
     return head.strip()
-FORCE_POST = (os.getenv("FORCE_POST", "0") == "1")
+
 # =========================
 # 投稿処理
 # =========================
@@ -240,9 +245,13 @@ def post_forecast():
     now = now_jst()
     today = now.date()
 
+    # -------------------------
+    # データ取得
+    # -------------------------
     times, pressures, temps, hums, codes = fetch_weather()
     times_dt = [datetime.fromisoformat(t).replace(tzinfo=TZ) for t in times]
 
+    # 時刻→データ辞書
     tmap = {}
     for tdt, p, tmp, h, c in zip(times_dt, pressures, temps, hums, codes):
         tmap[tdt] = {
@@ -252,8 +261,10 @@ def post_forecast():
             "code": int(c),
         }
 
+    # 基準（朝6時）
     base_dt = datetime.combine(today, dtime(6, 0), TZ)
-    base_p = tmap.get(base_dt, next(iter(tmap.values())))["pressure"]
+    base_data = tmap.get(base_dt, next(iter(tmap.values())))
+    base_i = int(round(base_data["pressure"]))
 
     def get_data(hour):
         if hour == 24:
@@ -262,54 +273,58 @@ def post_forecast():
             dt = datetime.combine(today, dtime(hour, 0), TZ)
         return tmap.get(dt, next(iter(tmap.values())))
 
-    base_i = int(round(base_p))
-h12_i = int(round(d12["pressure"]))
-h18_i = int(round(d18["pressure"]))
-h24_i = int(round(d24["pressure"]))
+    d12 = get_data(12)
+    d18 = get_data(18)
+    d24 = get_data(24)
 
-material = {
-    "h12": h12_i,
-    "h18": h18_i,
-    "h24": h24_i,
+    # 表示値を先に確定（差分も表示値同士で計算＝ズレ防止）
+    h12_i = int(round(d12["pressure"]))
+    h18_i = int(round(d18["pressure"]))
+    h24_i = int(round(d24["pressure"]))
 
-    # 差分は「表示値同士」で計算
-    "d12": h12_i - base_i,
-    "d18": h18_i - base_i,
-    "d24": h24_i - base_i,
+    material = {
+        "h12": h12_i,
+        "h18": h18_i,
+        "h24": h24_i,
 
-    "base": base_i,
+        "d12": h12_i - base_i,
+        "d18": h18_i - base_i,
+        "d24": h24_i - base_i,
 
-    "hum12": int(round(d12["hum"])),
-    "hum18": int(round(d18["hum"])),
-    "hum24": int(round(d24["hum"])),
+        "base": base_i,
 
-    "trend": "少し下がる" if (h24_i - base_i) <= -2 else "安定",
+        "hum12": int(round(d12["hum"])),
+        "hum18": int(round(d18["hum"])),
+        "hum24": int(round(d24["hum"])),
 
-    # ← ここに入れる
-    "emoji": code_to_emoji(d12["code"])
-}
+        "trend": "少し下がる" if (h24_i - base_i) <= -2 else "安定",
 
+        "emoji": code_to_emoji(d12["code"])
+    }
 
+    # -------------------------
+    # テキスト生成
+    # -------------------------
     head = build_head(material)
     body = gemini_body(material)
-
-    # 本文が長い日だけ分割（基本は1本）
     body_parts = split_by_sentence(body, TWEET_LIMIT)
 
-    # =========================
-    # DEBUG（ログに必ず出す）
-    # =========================
+    # -------------------------
+    # DEBUG（ログ）
+    # -------------------------
     print("=== DEBUG ===")
+    print("NOW(JST):", now_jst().isoformat())
     print("Using banner:", BANNER_PATH)
     print("Exists:", os.path.exists(BANNER_PATH))
     print("Head len:", len(head))
     print("Body len:", len(body))
     print("Body parts:", len(body_parts))
+    print("LAST_POST_DATE:", get_last_post_date())
     print("=============")
 
-    # =========================
+    # -------------------------
     # 画像アップロード（最初のツイートだけ）
-    # =========================
+    # -------------------------
     media_id = None
     try:
         if os.path.exists(BANNER_PATH):
@@ -322,9 +337,9 @@ material = {
         print("media_upload ERROR:", e)
         media_id = None
 
-    # =========================
+    # -------------------------
     # 投稿（ツリー）
-    # =========================
+    # -------------------------
     if media_id:
         first = x_client.create_tweet(text=head, media_ids=[media_id])
     else:
@@ -332,7 +347,6 @@ material = {
 
     parent_id = first.data["id"]
 
-    # 2ツイ目：本文（1〜n本）
     for p in body_parts:
         res = x_client.create_tweet(text=p, in_reply_to_tweet_id=parent_id)
         parent_id = res.data["id"]
@@ -350,10 +364,12 @@ def run_bot():
     print("DEPLOY_RUN:", DEPLOY_RUN)
     print("FORCE_POST:", FORCE_POST)
 
+    # テストで今すぐ投稿したい時だけ
     if FORCE_POST:
         post_forecast()
         return
 
+    # 起動時に、今日まだなら投稿（起動遅れ救済）
     if DEPLOY_RUN:
         if get_last_post_date() != now_jst().date():
             post_forecast()
@@ -361,8 +377,11 @@ def run_bot():
     while True:
         now = now_jst()
         today = now.date()
+
+        # 今日まだ投稿してなくて、投稿時刻を過ぎたら投稿（6時に落ちてても救済）
         if get_last_post_date() != today and now.hour >= POST_HOUR:
             post_forecast()
+
         time.sleep(30)
 
 if __name__ == "__main__":
