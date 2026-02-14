@@ -272,7 +272,7 @@ material = {
     "h18": h18_i,
     "h24": h24_i,
 
-    # 差分は「表示値同士」で計算（ズレ防止）
+    # 差分は「表示値同士」で計算
     "d12": h12_i - base_i,
     "d18": h18_i - base_i,
     "d24": h24_i - base_i,
@@ -283,11 +283,12 @@ material = {
     "hum18": int(round(d18["hum"])),
     "hum24": int(round(d24["hum"])),
 
-    # trend も表示と同じ整数差分で判断
-    "trend": "少し下がる" if (h24_i - base_i) <= -2 else "安定"
+    "trend": "少し下がる" if (h24_i - base_i) <= -2 else "安定",
+
+    # ← ここに入れる
+    "emoji": code_to_emoji(d12["code"])
 }
 
-    material["emoji"] = code_to_emoji(d12["code"])
 
     head = build_head(material)
     body = gemini_body(material)
