@@ -91,26 +91,28 @@ def set_last_post_date(d):
     save_state(st)
 
 # =========================
-# 天気取得（露点含む）
+# 天気取得（露点＋weathercode含む）
 # =========================
 def fetch_weather():
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={SENDAI_LAT}"
         f"&longitude={SENDAI_LON}"
-        "&hourly=surface_pressure,temperature_2m,relative_humidity_2m,dewpoint_2m"
+        "&hourly=surface_pressure,temperature_2m,relative_humidity_2m,dewpoint_2m,weathercode"
         "&timezone=Asia%2FTokyo"
         "&forecast_days=2"
     )
     r = requests.get(url, timeout=20)
     r.raise_for_status()
     j = r.json()
+
     return (
         j["hourly"]["time"],
         j["hourly"]["surface_pressure"],
         j["hourly"]["temperature_2m"],
         j["hourly"]["relative_humidity_2m"],
         j["hourly"]["dewpoint_2m"],
+        j["hourly"]["weathercode"],
     )
 
 # =========================
@@ -118,6 +120,17 @@ def fetch_weather():
 # =========================
 def get_closest(target_dt, tmap):
     return min(tmap.keys(), key=lambda k: abs((k - target_dt).total_seconds()))
+
+def code_to_emoji(code: int) -> str:
+    if 71 <= code <= 77:
+        return "❄️"
+    if 51 <= code <= 67:
+        return "☔"
+    if code == 0:
+        return "☀️"
+    if 1 <= code <= 3:
+        return "🌤"
+    return "🌥"
 
 def split_by_sentence(text, limit=TWEET_LIMIT):
     text = (text or "").strip()
@@ -132,33 +145,22 @@ def split_by_sentence(text, limit=TWEET_LIMIT):
         if len(rest) <= limit:
             parts.append(rest)
             break
-
         window = rest[:limit]
-        cut = max(
-            window.rfind("\n"),
-            window.rfind("。"),
-            window.rfind("！"),
-            window.rfind("？"),
-            window.rfind("、"),
-        )
+        cut = max(window.rfind("。"), window.rfind("\n"))
         if cut < 60:
             cut = limit
-
-        take_len = cut + (1 if cut != limit else 0)
-        parts.append(rest[:take_len].strip())
-        rest = rest[take_len:].strip()
-
-    return [p for p in parts if p]
+        parts.append(rest[:cut+1].strip())
+        rest = rest[cut+1:].strip()
+    return parts
 
 # =========================
-# コクリ仕様 判定ロジック
+# 判定ロジック（コクリ仕様）
 # =========================
 def classify_pressure(base, h12, h18, h24):
     vals = [base, h12, h18, h24]
     day_range = max(vals) - min(vals)
     delta = h24 - base
 
-    # 敏感寄り（コクリ仕様）
     if day_range >= 8 or abs(delta) >= 7:
         level = 2
         label = "変化大"
@@ -187,27 +189,22 @@ def closing_style(total_level: int) -> str:
     return "注意喚起"
 
 # =========================
-# Gemini 本文（キャスター風に締め方を変える）
+# Gemini本文
 # =========================
 def gemini_body(material):
     style = closing_style(material["total_level"])
 
     prompt = f"""
-あなたは天気予報キャスターのように、やさしい口調で仙台向け「気圧痛予報」の本文だけを書いてください。
+あなたは天気予報キャスター。
+仙台向け気圧痛予報の本文だけを書いてください。
 
-【本文の型（固定）】
 ・3文固定、改行なし
-・1文目：気圧が主役（方向と強さを短く。{material["pressure_label"]}／振れ幅{material["range"]}hPa／6→24差{material["delta"]:+d}hPa）
-・2文目：補足（気温差{material["temp_range"]}℃、露点最大{material["dew_max"]}℃を“体感”として控えめに触れる）
-・3文目：締め（{style} で締める）
-  - 安心：落ち着いた一日になりそう／心ほどける時間を、など
-  - 軽い注意：無理のない範囲で、いつもより丁寧に、など
-  - 注意喚起：今日は揺れが出やすいかも。予定は詰めすぎず、ゆったりめに、など
-※怖がらせない／宣伝しない／医療の断定や指示をしない
-※120〜170文字程度
-※本文のみ出力
-
-総合レベル: {material["total_level"]}
+・1文目：気圧が主役（{material["pressure_label"]}、振れ幅{material["range"]}hPa、6→24差{material["delta"]:+d}hPa）
+・2文目：補足（気温差{material["temp_range"]}℃、露点最大{material["dew_max"]}℃を体感として軽く）
+・3文目：{style} でやさしく締める
+・怖がらせない／宣伝しない／医療断定しない
+・120〜170文字
+・本文のみ出力
 """.strip()
 
     r = gen_client.models.generate_content(
@@ -218,26 +215,17 @@ def gemini_body(material):
     return (r.text or "").strip()
 
 # =========================
-# Gemini 追加（総合4以上のみ：短い注意喚起/補足）
+# 追加ひとこと（総合4以上のみ）
 # =========================
 def gemini_extra(material):
     prompt = f"""
-あなたは天気予報キャスター。
-仙台向け気圧痛予報の「追加のひとこと」だけを書いてください。
-
-【条件】
+天気予報キャスターの補足ひとことを書いてください。
 ・1〜2文、改行なし
-・70〜130文字
-・怖がらせない
-・医療の断定や指示をしない
-・宣伝しない
-・内容は「今日は変動が強めなので、ゆったりめに」程度のやさしい注意喚起や、体感の補足にする
+・80〜130文字
+・やさしい注意喚起
+・医療断定しない
 ・本文のみ出力
-
-気圧: {material["pressure_label"]}／振れ幅{material["range"]}hPa／6→24差{material["delta"]:+d}hPa
-気温差: {material["temp_range"]}℃
-露点最大: {material["dew_max"]}℃
-総合レベル: {material["total_level"]}
+総合レベル:{material["total_level"]}
 """.strip()
 
     r = gen_client.models.generate_content(
@@ -248,11 +236,12 @@ def gemini_extra(material):
     return (r.text or "").strip()
 
 # =========================
-# 見出し（1ツリー目）
+# 見出し
 # =========================
-def build_head(today, base, h12, h18, h24):
+def build_head(today, base, h12, h18, h24, emoji):
     return (
         f"【仙台｜低気圧頭痛・気圧痛予報】{today.strftime('%m月%d日')}\n"
+        f"おはようございます。整体院コクリの今日の気圧痛予報です {emoji}\n\n"
         f"・12時{h12}hPa({h12-base:+d})\n"
         f"・18時{h18}hPa({h18-base:+d})\n"
         f"・24時{h24}hPa({h24-base:+d})\n"
@@ -263,31 +252,31 @@ def build_head(today, base, h12, h18, h24):
 # 投稿処理
 # =========================
 def post_forecast():
+
     now = now_jst()
     today = now.date()
 
-    times, pressures, temps, hums, dews = fetch_weather()
+    times, pressures, temps, hums, dews, codes = fetch_weather()
     times_dt = [datetime.fromisoformat(t).replace(tzinfo=TZ) for t in times]
 
     tmap = {}
-    for t, p, tmp, h, dw in zip(times_dt, pressures, temps, hums, dews):
+    for t,p,tmp,h,dw,c in zip(times_dt, pressures, temps, hums, dews, codes):
         tmap[t] = {
             "pressure": float(p),
             "temp": float(tmp),
-            "hum": float(h),
             "dew": float(dw),
+            "code": int(c)
         }
 
-    # 基準（朝6時：最寄り）
-    base_dt = datetime.combine(today, dtime(6, 0), TZ)
+    base_dt = datetime.combine(today, dtime(6,0), TZ)
     base_key = get_closest(base_dt, tmap)
-    base = int(round(tmap[base_key]["pressure"]))
+    base = round(tmap[base_key]["pressure"])
 
     def get_hour(hour):
         if hour == 24:
-            dt = datetime.combine(today + timedelta(days=1), dtime(0, 0), TZ)
+            dt = datetime.combine(today+timedelta(days=1), dtime(0,0), TZ)
         else:
-            dt = datetime.combine(today, dtime(hour, 0), TZ)
+            dt = datetime.combine(today, dtime(hour,0), TZ)
         key = get_closest(dt, tmap)
         return tmap[key]
 
@@ -295,16 +284,18 @@ def post_forecast():
     d18 = get_hour(18)
     d24 = get_hour(24)
 
-    h12 = int(round(d12["pressure"]))
-    h18 = int(round(d18["pressure"]))
-    h24 = int(round(d24["pressure"]))
+    h12 = round(d12["pressure"])
+    h18 = round(d18["pressure"])
+    h24 = round(d24["pressure"])
+
+    emoji = code_to_emoji(d12["code"])
 
     pressure_level, label, day_range, delta = classify_pressure(base, h12, h18, h24)
 
     temp_vals = [d12["temp"], d18["temp"], d24["temp"]]
-    temp_range = int(round(max(temp_vals) - min(temp_vals)))
+    temp_range = round(max(temp_vals) - min(temp_vals))
 
-    dew_max = int(round(max(d12["dew"], d18["dew"], d24["dew"])))
+    dew_max = round(max(d12["dew"], d18["dew"], d24["dew"]))
 
     amplifier = classify_amplifier(temp_range, dew_max)
     total_level = pressure_level + amplifier
@@ -315,23 +306,18 @@ def post_forecast():
         "delta": delta,
         "temp_range": temp_range,
         "dew_max": dew_max,
-        "total_level": total_level,
+        "total_level": total_level
     }
 
-    head = build_head(today, base, h12, h18, h24)
+    head = build_head(today, base, h12, h18, h24, emoji)
     body = gemini_body(material)
-    body_parts = split_by_sentence(body, TWEET_LIMIT)
+    body_parts = split_by_sentence(body)
 
-    # 画像アップロード（1ツイート目だけ）
     media_id = None
-    try:
-        if os.path.exists(BANNER_PATH):
-            media = x_api_v1.media_upload(BANNER_PATH)
-            media_id = getattr(media, "media_id_string", None) or str(media.media_id)
-    except Exception:
-        media_id = None
+    if os.path.exists(BANNER_PATH):
+        media = x_api_v1.media_upload(BANNER_PATH)
+        media_id = getattr(media, "media_id_string", None)
 
-    # 1ツリー目（数値）
     if media_id:
         first = x_client.create_tweet(text=head, media_ids=[media_id])
     else:
@@ -339,15 +325,12 @@ def post_forecast():
 
     parent_id = first.data["id"]
 
-    # 2ツリー目（本文：常に）
     for p in body_parts:
         res = x_client.create_tweet(text=p, in_reply_to_tweet_id=parent_id)
         parent_id = res.data["id"]
 
-    # 3ツリー目（総合4以上のみ：追加のひとこと）
     if total_level >= 4:
         extra = gemini_extra(material)
-        extra = (extra or "").strip()
         if extra:
             x_client.create_tweet(text=extra, in_reply_to_tweet_id=parent_id)
 
@@ -359,29 +342,16 @@ def post_forecast():
 # =========================
 def run_bot():
     print("気圧痛予報BOT 起動")
-    print("NOW(JST):", now_jst().isoformat())
-    print("LAST_POST_DATE:", get_last_post_date())
-    print("DEPLOY_RUN:", DEPLOY_RUN)
     print("FORCE_POST:", FORCE_POST)
 
-    # テストで今すぐ投稿したい時だけ
     if FORCE_POST:
         post_forecast()
         return
 
-    # 起動時に、今日まだなら投稿（起動遅れ救済）
-    if DEPLOY_RUN:
-        if get_last_post_date() != now_jst().date():
-            post_forecast()
-
     while True:
         now = now_jst()
-        today = now.date()
-
-        # 今日まだ投稿してなくて、投稿時刻を過ぎたら投稿
-        if get_last_post_date() != today and now.hour >= POST_HOUR:
+        if get_last_post_date() != now.date() and now.hour >= POST_HOUR:
             post_forecast()
-
         time.sleep(60)
 
 if __name__ == "__main__":
