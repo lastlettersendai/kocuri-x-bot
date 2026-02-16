@@ -187,7 +187,7 @@ def closing_style(total_level: int) -> str:
     return "注意喚起"
 
 # =========================
-# Gemini 本文（キャスター風に締め方を変える）
+# Gemini 本文（キャスター風）
 # =========================
 def gemini_body(material):
     style = closing_style(material["total_level"])
@@ -218,7 +218,7 @@ def gemini_body(material):
     return (r.text or "").strip()
 
 # =========================
-# Gemini 追加（総合4以上のみ：短い注意喚起/補足）
+# Gemini 追加（総合4以上のみ）
 # =========================
 def gemini_extra(material):
     prompt = f"""
@@ -260,99 +260,159 @@ def build_head(today, base, h12, h18, h24):
     ).strip()
 
 # =========================
-# 投稿処理
+# 投稿処理（403でも落ちない・増殖しない）
 # =========================
 def post_forecast():
     now = now_jst()
     today = now.date()
 
-    times, pressures, temps, hums, dews = fetch_weather()
-    times_dt = [datetime.fromisoformat(t).replace(tzinfo=TZ) for t in times]
+    try:
+        # -------------------------
+        # データ取得
+        # -------------------------
+        times, pressures, temps, hums, dews = fetch_weather()
+        times_dt = [datetime.fromisoformat(t).replace(tzinfo=TZ) for t in times]
 
-    tmap = {}
-    for t, p, tmp, h, dw in zip(times_dt, pressures, temps, hums, dews):
-        tmap[t] = {
-            "pressure": float(p),
-            "temp": float(tmp),
-            "hum": float(h),
-            "dew": float(dw),
+        tmap = {}
+        for t, p, tmp, h, dw in zip(times_dt, pressures, temps, hums, dews):
+            tmap[t] = {
+                "pressure": float(p),
+                "temp": float(tmp),
+                "hum": float(h),
+                "dew": float(dw),
+            }
+
+        # 基準（朝6時：最寄り）
+        base_dt = datetime.combine(today, dtime(6, 0), TZ)
+        base_key = get_closest(base_dt, tmap)
+        base = int(round(tmap[base_key]["pressure"]))
+
+        def get_hour(hour):
+            if hour == 24:
+                dt = datetime.combine(today + timedelta(days=1), dtime(0, 0), TZ)
+            else:
+                dt = datetime.combine(today, dtime(hour, 0), TZ)
+            key = get_closest(dt, tmap)
+            return tmap[key]
+
+        d12 = get_hour(12)
+        d18 = get_hour(18)
+        d24 = get_hour(24)
+
+        h12 = int(round(d12["pressure"]))
+        h18 = int(round(d18["pressure"]))
+        h24 = int(round(d24["pressure"]))
+
+        pressure_level, label, day_range, delta = classify_pressure(base, h12, h18, h24)
+
+        temp_vals = [d12["temp"], d18["temp"], d24["temp"]]
+        temp_range = int(round(max(temp_vals) - min(temp_vals)))
+
+        dew_max = int(round(max(d12["dew"], d18["dew"], d24["dew"])))
+
+        amplifier = classify_amplifier(temp_range, dew_max)
+        total_level = pressure_level + amplifier
+
+        material = {
+            "pressure_label": label,
+            "range": day_range,
+            "delta": delta,
+            "temp_range": temp_range,
+            "dew_max": dew_max,
+            "total_level": total_level,
         }
 
-    # 基準（朝6時：最寄り）
-    base_dt = datetime.combine(today, dtime(6, 0), TZ)
-    base_key = get_closest(base_dt, tmap)
-    base = int(round(tmap[base_key]["pressure"]))
+        # -------------------------
+        # 1ツリー目（数値）投稿
+        # -------------------------
+        head = build_head(today, base, h12, h18, h24)
 
-    def get_hour(hour):
-        if hour == 24:
-            dt = datetime.combine(today + timedelta(days=1), dtime(0, 0), TZ)
-        else:
-            dt = datetime.combine(today, dtime(hour, 0), TZ)
-        key = get_closest(dt, tmap)
-        return tmap[key]
-
-    d12 = get_hour(12)
-    d18 = get_hour(18)
-    d24 = get_hour(24)
-
-    h12 = int(round(d12["pressure"]))
-    h18 = int(round(d18["pressure"]))
-    h24 = int(round(d24["pressure"]))
-
-    pressure_level, label, day_range, delta = classify_pressure(base, h12, h18, h24)
-
-    temp_vals = [d12["temp"], d18["temp"], d24["temp"]]
-    temp_range = int(round(max(temp_vals) - min(temp_vals)))
-
-    dew_max = int(round(max(d12["dew"], d18["dew"], d24["dew"])))
-
-    amplifier = classify_amplifier(temp_range, dew_max)
-    total_level = pressure_level + amplifier
-
-    material = {
-        "pressure_label": label,
-        "range": day_range,
-        "delta": delta,
-        "temp_range": temp_range,
-        "dew_max": dew_max,
-        "total_level": total_level,
-    }
-
-    head = build_head(today, base, h12, h18, h24)
-    body = gemini_body(material)
-    body_parts = split_by_sentence(body, TWEET_LIMIT)
-
-    # 画像アップロード（1ツイート目だけ）
-    media_id = None
-    try:
-        if os.path.exists(BANNER_PATH):
-            media = x_api_v1.media_upload(BANNER_PATH)
-            media_id = getattr(media, "media_id_string", None) or str(media.media_id)
-    except Exception:
         media_id = None
+        try:
+            if os.path.exists(BANNER_PATH):
+                media = x_api_v1.media_upload(BANNER_PATH)
+                media_id = getattr(media, "media_id_string", None) or str(media.media_id)
+        except Exception as e:
+            print("media_upload ERROR:", repr(e))
+            media_id = None
 
-    # 1ツリー目（数値）
-    if media_id:
-        first = x_client.create_tweet(text=head, media_ids=[media_id])
-    else:
-        first = x_client.create_tweet(text=head)
+        try:
+            if media_id:
+                first = x_client.create_tweet(text=head, media_ids=[media_id])
+            else:
+                first = x_client.create_tweet(text=head)
+        except Exception as e:
+            print("create_tweet(head) ERROR:", repr(e))
+            return  # 1ツリー目が出せないなら中断
 
-    parent_id = first.data["id"]
+        # ★最重要：1ツリー目が出た時点で今日投稿済みにして増殖を止める
+        set_last_post_date(today)
 
-    # 2ツリー目（本文：常に）
-    for p in body_parts:
-        res = x_client.create_tweet(text=p, in_reply_to_tweet_id=parent_id)
-        parent_id = res.data["id"]
+        parent_id = first.data["id"]
 
-    # 3ツリー目（総合4以上のみ：追加のひとこと）
-    if total_level >= 4:
-        extra = gemini_extra(material)
-        extra = (extra or "").strip()
-        if extra:
-            x_client.create_tweet(text=extra, in_reply_to_tweet_id=parent_id)
+        # -------------------------
+        # 2ツリー目（本文）— Gemini失敗でも必ず出す
+        # -------------------------
+        body = ""
+        try:
+            body = (gemini_body(material) or "").strip()
+        except Exception as e:
+            print("gemini_body ERROR:", repr(e))
+            body = ""
 
-    set_last_post_date(today)
-    print("投稿完了")
+        # フォールバック（Geminiが空でも2ツリー目を必ず投稿）
+        if not body:
+            style = closing_style(total_level)
+            if style == "安心":
+                tail = "全体としては落ち着いた一日になりそうです。どうぞ心ほどける時間を。"
+            elif style == "軽い注意":
+                tail = "大きな乱れは少なそうですが、無理のない範囲で少しゆったりめに。"
+            else:
+                tail = "今日は揺れが出やすいかもしれません。予定は詰めすぎず、ゆったりめに。"
+
+            body = (
+                f"気圧は{label}で、振れ幅は{day_range}hPa、6→24差は{delta:+d}hPaです。"
+                f"気温差{temp_range}℃や空気の重さ（露点最大{dew_max}℃）が体感に影響することもあります。"
+                f"{tail}"
+            )
+
+        body_parts = split_by_sentence(body, TWEET_LIMIT) or [body]
+
+        for p in body_parts:
+            try:
+                res = x_client.create_tweet(text=p, in_reply_to_tweet_id=parent_id)
+                parent_id = res.data["id"]
+            except tweepy.errors.Forbidden as e:
+                print("reply Forbidden(403):", e)
+                break  # ツリーは諦めて終了（落とさない）
+            except Exception as e:
+                print("reply ERROR:", repr(e))
+                break
+
+        # -------------------------
+        # 3ツリー目（総合4以上のみ）
+        # -------------------------
+        if total_level >= 4:
+            extra = ""
+            try:
+                extra = (gemini_extra(material) or "").strip()
+            except Exception as e:
+                print("gemini_extra ERROR:", repr(e))
+                extra = ""
+
+            if extra:
+                try:
+                    x_client.create_tweet(text=extra, in_reply_to_tweet_id=parent_id)
+                except tweepy.errors.Forbidden as e:
+                    print("extra Forbidden(403):", e)
+                except Exception as e:
+                    print("extra ERROR:", repr(e))
+
+        print("投稿完了")
+
+    except Exception as e:
+        print("post_forecast FATAL ERROR:", repr(e))
+        return
 
 # =========================
 # 常駐
