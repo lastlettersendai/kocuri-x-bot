@@ -1,387 +1,277 @@
 import os
 import time
 import json
-import logging
+import re
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
-from typing import Optional, List, Dict, Any
 
 import requests
 import tweepy
+# 最新のSDK: pip install google-genai
 from google import genai
 from google.genai import types
 
 # =========================
-# ログ設定
-# =========================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-# =========================
-# 環境変数チェック
-# =========================
-REQUIRED = ["X_BEARER_TOKEN", "API_KEY", "API_SECRET", "ACCESS_TOKEN", "ACCESS_TOKEN_SECRET", "GEMINI_API_KEY"]
-missing = [v for v in REQUIRED if not os.getenv(v)]
-if missing:
-    logging.error(f"不足環境変数: {missing}")
-    raise SystemExit(1)
-
-# =========================
 # 基本設定
 # =========================
-TZ = ZoneInfo("Asia/Tokyo")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-STATE_PATH = os.path.join(BASE_DIR, "pressure_state.json")
-BANNER_PATH = os.path.join(BASE_DIR, "pressurex.jpg")  # 固定画像
-
-POST_HOUR = int(os.getenv("POST_HOUR", "6"))
-TWEET_LIMIT = 128  # 返信側の安全マージン（親は短縮リトライで担保）
+TZ = ZoneInfo("Asia/Tokyo")
 
 SENDAI_LAT = 38.2682
 SENDAI_LON = 140.8694
 
-OPEN_METEO_TIMEOUT = 15
-NEAREST_MAX_DIFF_SEC = 3600  # 1時間以上ズレたデータは信用しない
+POST_HOUR = int(os.getenv("POST_HOUR", "6"))
+
+# 日本語(全角)は140文字が限界のため、安全マージンをとって135に設定
+TWEET_LIMIT = 135
+
+STATE_PATH = os.getenv("PRESSURE_STATE_PATH", "pressure_state.json")
+BANNER_NAME = os.getenv("PRESSURE_BANNER_PATH", "pressurex.jpg")
+BANNER_PATH = os.path.join(BASE_DIR, BANNER_NAME)
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")  # モデル名は適宜変更
+GEMINI_TEMP = float(os.getenv("GEMINI_TEMP", "0.6"))
+
+DEPLOY_RUN = (os.getenv("DEPLOY_RUN", "0") == "1")
+FORCE_POST = (os.getenv("FORCE_POST", "0") == "1")
 
 # =========================
-# クライアント初期化（v1.1:画像 / v2:投稿）
+# Xクライアント
 # =========================
-try:
-    auth = tweepy.OAuth1UserHandler(
-        os.getenv("API_KEY"), os.getenv("API_SECRET"),
-        os.getenv("ACCESS_TOKEN"), os.getenv("ACCESS_TOKEN_SECRET")
+x_client = tweepy.Client(
+    bearer_token=os.getenv("X_BEARER_TOKEN"),
+    consumer_key=os.getenv("API_KEY"),
+    consumer_secret=os.getenv("API_SECRET"),
+    access_token=os.getenv("ACCESS_TOKEN"),
+    access_token_secret=os.getenv("ACCESS_TOKEN_SECRET")
+)
+
+x_api_v1 = tweepy.API(
+    tweepy.OAuth1UserHandler(
+        os.getenv("API_KEY"),
+        os.getenv("API_SECRET"),
+        os.getenv("ACCESS_TOKEN"),
+        os.getenv("ACCESS_TOKEN_SECRET"),
     )
-    x_api_v1 = tweepy.API(auth)
+)
 
-    x_client = tweepy.Client(
-        bearer_token=os.getenv("X_BEARER_TOKEN"),
-        consumer_key=os.getenv("API_KEY"),
-        consumer_secret=os.getenv("API_SECRET"),
-        access_token=os.getenv("ACCESS_TOKEN"),
-        access_token_secret=os.getenv("ACCESS_TOKEN_SECRET")
-    )
-
-    gen_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-except Exception as e:
-    logging.error(f"クライアント初期化失敗: {e}")
-    raise SystemExit(1)
+gen_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # =========================
-# 状態管理（attempt/success分離）
+# 状態管理
 # =========================
-def load_state() -> Dict[str, Any]:
+def now_jst():
+    return datetime.now(TZ)
+
+def load_state():
     if not os.path.exists(STATE_PATH):
-        return {}
+        return {"last_post_date": None, "last_body": "", "last_extra": ""}
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f) or {}
-    except Exception as e:
-        logging.warning(f"状態ファイル読み込みエラー: {e}")
-        return {}
+            st = json.load(f) or {}
+            st.setdefault("last_post_date", None)
+            st.setdefault("last_body", "")
+            st.setdefault("last_extra", "")
+            return st
+    except Exception:
+        return {"last_post_date": None, "last_body": "", "last_extra": ""}
 
-def save_state(state: Dict[str, Any]) -> None:
+def save_state(state):
     try:
         with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False)
-    except Exception as e:
-        logging.error(f"状態ファイル書き込みエラー: {e}")
-        raise
-
-def mark_attempt(today_str: str) -> None:
-    state = load_state()
-    state["last_attempt_date"] = today_str
-    save_state(state)
-
-def mark_success(today_str: str) -> None:
-    state = load_state()
-    state["last_success_date"] = today_str
-    save_state(state)
-
-def attempted_today(today_str: str) -> bool:
-    return load_state().get("last_attempt_date") == today_str
-
-def succeeded_today(today_str: str) -> bool:
-    return load_state().get("last_success_date") == today_str
-
-# =========================
-# 文字数安全投稿（186厳密 + 画像対応）
-# =========================
-def is_tweet_too_long(err: tweepy.errors.Forbidden) -> bool:
-    # 可能ならレスポンスJSONの code=186 を読む
-    try:
-        if getattr(err, "response", None) is not None:
-            j = err.response.json()
-            errors = j.get("errors", [])
-            if errors and errors[0].get("code") == 186:
-                return True
+            json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
-    # フォールバック：文言
-    msg = str(err).lower()
-    return ("186" in msg) or ("too long" in msg)
 
-def safe_post(text: str, reply_to: Optional[str] = None, media_id: Optional[str] = None) -> str:
-    s = (text or "").strip()
-    if not s:
-        raise ValueError("空テキストは投稿できません")
-
-    for i in range(5):
-        try:
-            kwargs: Dict[str, Any] = {"text": s, "user_auth": True}
-            if reply_to:
-                kwargs["in_reply_to_tweet_id"] = reply_to
-            if media_id:
-                kwargs["media_ids"] = [media_id]
-
-            res = x_client.create_tweet(**kwargs)
-            if not res or not res.data or "id" not in res.data:
-                raise RuntimeError("create_tweet のレスポンスに id がありません")
-            return res.data["id"]
-
-        except tweepy.errors.Forbidden as e:
-            if is_tweet_too_long(e):
-                logging.warning(f"文字数オーバー。短縮再試行({i+1}/5) len={len(s)}")
-                if len(s) <= 10:
-                    raise RuntimeError("短縮余地がなく投稿できません") from e
-                s = s[:-5]
-                continue
-
-            logging.error(f"Forbidden(短縮不可): {e}")
-            raise
-
-        except Exception as e:
-            logging.error(f"投稿エラー: {e}")
-            raise
-
-    raise RuntimeError("文字数調整失敗（リトライ上限）")
-
-# =========================
-# 気象取得（キー/長さ厳密）
-# =========================
-def fetch_weather() -> Optional[Dict[str, Any]]:
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": SENDAI_LAT,
-        "longitude": SENDAI_LON,
-        "hourly": ["surface_pressure"],
-        "timezone": "Asia/Tokyo",
-        "forecast_days": 2,
-    }
+def get_last_post_date():
+    st = load_state()
+    v = st.get("last_post_date")
+    if not v:
+        return None
     try:
-        r = requests.get(url, params=params, timeout=OPEN_METEO_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-
-        hourly = data.get("hourly")
-        if not hourly:
-            raise ValueError("hourly がありません")
-        if "time" not in hourly or "surface_pressure" not in hourly:
-            raise ValueError("time / surface_pressure がありません")
-
-        times = hourly["time"]
-        pressures = hourly["surface_pressure"]
-        if not isinstance(times, list) or not isinstance(pressures, list):
-            raise ValueError("time/surface_pressure が list ではありません")
-        if len(times) != len(pressures):
-            raise ValueError(f"長さ不一致: time={len(times)} pressure={len(pressures)}")
-
-        return hourly
-
-    except Exception as e:
-        logging.error(f"天気取得失敗: {e}")
+        return datetime.fromisoformat(v).date()
+    except Exception:
         return None
 
-def build_dt_list(times_str: List[str]) -> List[Optional[datetime]]:
-    # インデックス整合性を崩さない：失敗は None を入れて長さ維持
-    dt_list: List[Optional[datetime]] = []
-    for t in times_str:
-        try:
-            dt = datetime.fromisoformat(t)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=TZ)
-            dt_list.append(dt)
-        except Exception:
-            logging.warning(f"日時変換エラー: {t}")
-            dt_list.append(None)
-    return dt_list
+def set_last_post_date(d):
+    st = load_state()
+    st["last_post_date"] = datetime.combine(d, dtime(0, 0), TZ).isoformat()
+    save_state(st)
 
-def get_nearest_index(dt_list: List[Optional[datetime]], target_dt: datetime, max_diff_sec: int = NEAREST_MAX_DIFF_SEC) -> Optional[int]:
-    candidates = []
-    for i, dt in enumerate(dt_list):
-        if dt is None:
-            continue
-        diff = abs((dt - target_dt).total_seconds())
-        candidates.append((diff, i))
+def get_last_texts():
+    st = load_state()
+    return (st.get("last_body", "") or "").strip(), (st.get("last_extra", "") or "").strip()
 
-    if not candidates:
-        logging.error("時刻リストに有効なdatetimeがありません")
-        return None
-
-    min_diff, best_i = min(candidates, key=lambda x: x[0])
-    if min_diff > max_diff_sec:
-        logging.error(f"指定時刻 {target_dt} のデータが見つかりません（最小誤差: {min_diff}秒）")
-        return None
-    return best_i
+def set_last_texts(body: str, extra: str):
+    st = load_state()
+    st["last_body"] = (body or "").strip()
+    st["last_extra"] = (extra or "").strip()
+    save_state(st)
 
 # =========================
-# 表示ロジック
+# 天気取得（露点含む）
 # =========================
-def classify(delta: int) -> int:
-    if abs(delta) >= 8:
-        return 3
-    if abs(delta) >= 5:
-        return 2
-    if abs(delta) >= 3:
-        return 1
-    return 0
-
-def color(level: int) -> str:
-    return ["🔵", "🟢", "🟡", "🔴"][level]
-
-def label(level: int) -> str:
-    return ["安定", "やや変動", "要注意", "警戒"][level]
-
-def headline(level: int) -> str:
-    if level == 0:
-        return "今日は体が軽い日"
-    if level == 1:
-        return "今日は少し揺れやすい日"
-    if level == 2:
-        return "今日は頭が重くなりやすい日"
-    return "今日は気圧変動大きめ"
-
-# =========================
-# Gemini本文（握りつぶさない）
-# =========================
-def generate_body(delta: int) -> str:
-    prompt = f"""
-あなたは仙台の整体師。
-今日は気圧が{delta:+d}hPa変化します。
-
-要件:
-- 「気圧の上昇/下降で体がどう感じやすいか」を自然な日本語で
-- 後頭部/こめかみ/だるさ/眠気 などを織り交ぜる
-- 120文字以内
-- 医療的断定はしない
-- 宣伝はしない
-- 出力は本文のみ
-"""
-    r = gen_client.models.generate_content(
-        model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
-        contents=prompt.strip(),
-        config=types.GenerateContentConfig(temperature=0.7),
+def fetch_weather():
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={SENDAI_LAT}"
+        f"&longitude={SENDAI_LON}"
+        "&hourly=surface_pressure,temperature_2m,relative_humidity_2m,dewpoint_2m"
+        "&timezone=Asia%2FTokyo"
+        "&forecast_days=2"
     )
-    text = (r.text or "").strip()
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    return (
+        j["hourly"]["time"],
+        j["hourly"]["surface_pressure"],
+        j["hourly"]["temperature_2m"],
+        j["hourly"]["relative_humidity_2m"],
+        j["hourly"]["dewpoint_2m"],
+    )
+
+# =========================
+# 補助
+# =========================
+def get_closest(target_dt, tmap):
+    if not tmap:
+        raise ValueError("Weather data is empty")
+    return min(tmap.keys(), key=lambda k: abs((k - target_dt).total_seconds()))
+
+def split_by_sentence(text, limit=TWEET_LIMIT):
+    text = (text or "").strip()
     if not text:
-        raise ValueError("Geminiレスポンスが空です")
-    return text
+        return []
+    if len(text) <= limit:
+        return [text]
 
-# =========================
-# 投稿メインプロセス
-# =========================
-def post_forecast() -> bool:
-    now = datetime.now(TZ)
-    today = now.date()
-    today_str = str(today)
-
-    hourly = fetch_weather()
-    if not hourly:
-        return False
-
-    times_str = hourly["time"]
-    pressures = hourly["surface_pressure"]
-    dt_list = build_dt_list(times_str)
-
-    t06 = datetime.combine(today, dtime(6, 0), tzinfo=TZ)
-    t12 = datetime.combine(today, dtime(12, 0), tzinfo=TZ)
-    t18 = datetime.combine(today, dtime(18, 0), tzinfo=TZ)
-    t24 = datetime.combine(today + timedelta(days=1), dtime(0, 0), tzinfo=TZ)
-
-    i06 = get_nearest_index(dt_list, t06)
-    i12 = get_nearest_index(dt_list, t12)
-    i18 = get_nearest_index(dt_list, t18)
-    i24 = get_nearest_index(dt_list, t24)
-
-    if None in [i06, i12, i18, i24]:
-        logging.error("必要な時刻のデータが揃わないため投稿中止")
-        return False
-
-    # ✅ 「投稿できる前提が揃った」段階で attempt を刻む（品質UP）
-    mark_attempt(today_str)
-
-    base = int(round(pressures[i06]))  # type: ignore[index]
-    h12  = int(round(pressures[i12]))  # type: ignore[index]
-    h18  = int(round(pressures[i18]))  # type: ignore[index]
-    h24  = int(round(pressures[i24]))  # type: ignore[index]
-
-    delta = h24 - base
-    lvl = classify(delta)
-
-    head_text = (
-        f"【仙台｜低気圧頭痛・天気痛予報】{today.strftime('%m/%d')}\n\n"
-        f"{color(lvl)} {label(lvl)}｜{headline(lvl)}\n\n"
-        f"朝6時 {base}hPa\n"
-        f"→ 夜にかけて {delta:+d}hPa\n\n"
-        f"・12時 {h12}hPa({h12-base:+d})\n"
-        f"・18時 {h18}hPa({h18-base:+d})\n"
-        f"・24時 {h24}hPa({h24-base:+d})"
-    )
-
-    # 画像アップロード
-    media_id: Optional[str] = None
-    if os.path.exists(BANNER_PATH):
-        try:
-            media = x_api_v1.media_upload(BANNER_PATH)
-            # ✅ v2 へ渡すのは string が安全
-            media_id = getattr(media, "media_id_string", None) or str(media.media_id)
-            logging.info("画像アップロード成功")
-        except Exception as e:
-            logging.error(f"画像アップロード失敗: {e}")
-
-    # 投稿（失敗は握りつぶさない）
-    parent = safe_post(head_text, media_id=media_id)
-    body = generate_body(delta)
-    safe_post(body, reply_to=parent)
-
-    mark_success(today_str)
-    logging.info("=== 投稿完了 ===")
-    return True
-
-# =========================
-# メインループ
-# =========================
-def run_bot() -> None:
-    logging.info(f"BOT起動 [Single Image Version] (POST_HOUR: {POST_HOUR})")
-
-    while True:
-        try:
-            now = datetime.now(TZ)
-            today_str = str(now.date())
-
-            # 稼働確認ログ（1時間おき）
-            if now.minute == 0 and now.second == 0:
-                logging.info("BOT稼働中...")
-
-            # 今日すでに試行済みなら二度と打たない（成功/失敗問わず）
-            if (not attempted_today(today_str)) and now.hour >= POST_HOUR:
-                logging.info(f"投稿判定: {now.isoformat()}")
-                ok = post_forecast()
-                logging.info(f"結果: {'SUCCESS' if ok else 'SKIP/FAIL'}")
-
-            # ✅ 分境界に同期（処理時間ぶんのズレを吸収）
-            now2 = datetime.now(TZ)
-            sleep_sec = 60 - now2.second
-            if sleep_sec <= 0:
-                sleep_sec = 1
-            time.sleep(sleep_sec)
-
-        except KeyboardInterrupt:
-            logging.info("手動停止")
+    parts = []
+    rest = text
+    while rest:
+        if len(rest) <= limit:
+            parts.append(rest)
             break
-        except Exception as e:
-            # 例外は必ずスタックトレース付きで残す
-            logging.exception(f"ループ例外: {e}")
-            time.sleep(60)
 
-if __name__ == "__main__":
-    run_bot()
+        window = rest[:limit]
+        cut = max(
+            window.rfind("\n"),
+            window.rfind("。"),
+            window.rfind("！"),
+            window.rfind("？"),
+            window.rfind("、"),
+        )
+        if cut < 10:
+            cut = limit
+
+        take_len = cut + (1 if cut != limit else 0)
+        parts.append(rest[:take_len].strip())
+        rest = rest[take_len:].strip()
+
+    return [p for p in parts if p]
+
+# =========================
+# コクリ仕様 判定ロジック
+# =========================
+def classify_pressure(base, h12, h18, h24):
+    vals = [base, h12, h18, h24]
+    day_range = max(vals) - min(vals)
+    delta = h24 - base
+
+    if day_range >= 8 or abs(delta) >= 7:
+        level = 2
+        label = "変化大"
+    elif day_range >= 5 or abs(delta) >= 4:
+        level = 1
+        label = "やや変化"
+    else:
+        level = 0
+        label = "穏やか"
+
+    return level, label, day_range, delta
+
+def classify_amplifier(temp_range, dew_max):
+    score = 0
+    if temp_range >= 7:
+        score += 1
+    if dew_max >= 16:
+        score += 1
+    return score
+
+def closing_style(total_level: int) -> str:
+    if total_level <= 1:
+        return "安心"
+    if total_level <= 3:
+        return "軽い注意"
+    return "注意喚起"
+
+# =========================
+# Gemini 設定
+# =========================
+SAFETY_SETTINGS = [
+    types.SafetySetting(
+        category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH
+    ),
+    types.SafetySetting(
+        category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+        threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH
+    ),
+    types.SafetySetting(
+        category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH
+    ),
+]
+
+# 口語が混ざったら弾く（再生成のトリガ）
+BANNED_PHRASES = [
+    "かもね", "だよ", "だね", "してね", "じゃん", "みたい",
+    "あなた", "みなさん"
+]
+BANNED_RE = re.compile("|".join(map(re.escape, BANNED_PHRASES)))
+
+def looks_bad_tone(text: str) -> bool:
+    if not text:
+        return True
+    if "\n" in text:
+        return True  # 改行なしルール
+    if BANNED_RE.search(text):
+        return True
+    # です・ますが全く無いのも危険（フランク寄り）
+    if ("です" not in text) and ("ます" not in text):
+        return True
+    return False
+
+def _gemini_generate(prompt: str, temperature: float):
+    r = gen_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=temperature,
+            safety_settings=SAFETY_SETTINGS
+        )
+    )
+    return (r.text or "").strip()
+
+def gemini_body(material, prev_body: str = ""):
+    style = closing_style(material["total_level"])
+
+    prompt = f"""
+あなたは天気予報キャスターです。仙台向け「気圧痛予報」の本文だけを書いてください。
+
+【本文の型（固定）】
+・3文固定、改行なし
+・1文目：気圧が主役（方向と強さを短く。{material["pressure_label"]}／振れ幅{material["range"]}hPa／6→24差{material["delta"]:+d}hPa）
+・2文目：補足（気温差{material["temp_range"]}℃、露点最大{material["dew_max"]}℃を“体感”として控えめに触れる）
+・3文目：締め（{style} で締める）
+  - 安心：落ち着いた一日になりそう／心ほどける時間を、など
+  - 軽い注意：無理のない範囲で／いつもより丁寧に、など
+  - 注意喚起：予定は詰めすぎず／ゆったりめに、など
+
+【口調の厳守】
+・必ず「です／ます」調で統一（です・ますを必ず入れる）
+・禁止語：「〜かもね」「〜だね」「〜だよ」「〜してね」「みたい」「〜じゃん」
+・二人称（あなた／みなさん）禁止
+・怖がらせない／宣伝しない／医療の断定や指示をしない
+・120〜130文字程度
+・本文のみ出力
