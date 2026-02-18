@@ -223,8 +223,6 @@ def gemini_body(material, prev_body: str = "", mmdd: str = ""):
 ・露点最大：{material['dew_max']}℃
 ・アドバイス基準：{closing_style(material['total_level'])}
 
-'])}
-
 【構成（厳守）】
 ・必ず3文で構成すること。
 ・1文目：数値を含めた今日({mmdd})の気圧状況を具体的に。
