@@ -215,7 +215,7 @@ def gemini_generate(prompt: str) -> str:
 
 def gemini_body(material, prev_body: str = "", mmdd: str = ""):
     prompt = f"""
-あなたは仙台の整体院の天気予報キャスターです。以下のデータを使って、気圧痛に悩む方向けのX投稿文を120文字程度で作成してください。
+あなたは天気予報キャスターです。以下のデータを使って、気圧痛に悩む方向けのX投稿文を120文字程度で作成してください。
 
 【データ】
 ・気圧変化：{material['pressure_label']}（振れ幅 {material['range']}hPa / 6→24時差 {material['delta']:+d}hPa）
@@ -224,6 +224,7 @@ def gemini_body(material, prev_body: str = "", mmdd: str = ""):
 ・アドバイス基準：{closing_style(material['total_level'])}
 
 【執筆ルール（厳守）】
+・文頭に【】などの見出しや肩書きは付けないこと。
 ・「露点」という専門用語は絶対に使わないこと。
 ・代わりに露点の数値を参考に、体感に翻訳して自然に組み込むこと。
 ・です/ます調
