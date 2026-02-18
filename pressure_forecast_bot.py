@@ -7,7 +7,6 @@ from zoneinfo import ZoneInfo
 
 import requests
 import tweepy
-# 最新のSDK: pip install google-genai
 from google import genai
 from google.genai import types
 
@@ -22,14 +21,14 @@ SENDAI_LON = 140.8694
 
 POST_HOUR = int(os.getenv("POST_HOUR", "6"))
 
-# 日本語(全角)は140文字が限界のため、安全マージンをとって135に設定
+# 日本語は140文字制限が厳しいため安全マージン
 TWEET_LIMIT = 135
 
 STATE_PATH = os.getenv("PRESSURE_STATE_PATH", "pressure_state.json")
 BANNER_NAME = os.getenv("PRESSURE_BANNER_PATH", "pressurex.jpg")
 BANNER_PATH = os.path.join(BASE_DIR, BANNER_NAME)
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")  # モデル名は適宜変更
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 GEMINI_TEMP = float(os.getenv("GEMINI_TEMP", "0.6"))
 
 DEPLOY_RUN = (os.getenv("DEPLOY_RUN", "0") == "1")
@@ -58,7 +57,7 @@ x_api_v1 = tweepy.API(
 gen_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # =========================
-# 状態管理
+# 状態管理（前回文面も保存）
 # =========================
 def now_jst():
     return datetime.now(TZ)
@@ -69,10 +68,10 @@ def load_state():
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             st = json.load(f) or {}
-            st.setdefault("last_post_date", None)
-            st.setdefault("last_body", "")
-            st.setdefault("last_extra", "")
-            return st
+        st.setdefault("last_post_date", None)
+        st.setdefault("last_body", "")
+        st.setdefault("last_extra", "")
+        return st
     except Exception:
         return {"last_post_date": None, "last_body": "", "last_extra": ""}
 
@@ -171,7 +170,7 @@ def split_by_sentence(text, limit=TWEET_LIMIT):
     return [p for p in parts if p]
 
 # =========================
-# コクリ仕様 判定ロジック
+# 判定ロジック
 # =========================
 def classify_pressure(base, h12, h18, h24):
     vals = [base, h12, h18, h24]
@@ -206,7 +205,7 @@ def closing_style(total_level: int) -> str:
     return "注意喚起"
 
 # =========================
-# Gemini 設定
+# Gemini 安全設定
 # =========================
 SAFETY_SETTINGS = [
     types.SafetySetting(
@@ -223,7 +222,7 @@ SAFETY_SETTINGS = [
     ),
 ]
 
-# 口語が混ざったら弾く（再生成のトリガ）
+# 口調ブレ検知（フランク/二人称/改行など）
 BANNED_PHRASES = [
     "かもね", "だよ", "だね", "してね", "じゃん", "みたい",
     "あなた", "みなさん"
@@ -234,15 +233,15 @@ def looks_bad_tone(text: str) -> bool:
     if not text:
         return True
     if "\n" in text:
-        return True  # 改行なしルール
+        return True
     if BANNED_RE.search(text):
         return True
-    # です・ますが全く無いのも危険（フランク寄り）
+    # です/ますがゼロだと友だち口調になりやすいので弾く
     if ("です" not in text) and ("ます" not in text):
         return True
     return False
 
-def _gemini_generate(prompt: str, temperature: float):
+def _gemini_generate(prompt: str, temperature: float) -> str:
     r = gen_client.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
@@ -253,16 +252,31 @@ def _gemini_generate(prompt: str, temperature: float):
     )
     return (r.text or "").strip()
 
+def _try_generate(prompt: str, base_temp: float) -> str:
+    # 口調ブレ/禁止語混入時に最大2回だけ再生成（暴れ防止）
+    temps = [base_temp, max(0.2, base_temp - 0.2), 0.2]
+    last = ""
+    for t in temps:
+        try:
+            last = _gemini_generate(prompt, t)
+            if not looks_bad_tone(last):
+                return last
+        except Exception as e:
+            print("Gemini generate error:", repr(e))
+            continue
+    return (last or "").strip()
+
 def gemini_body(material, prev_body: str = ""):
     style = closing_style(material["total_level"])
 
-    prompt = f"""
+    # ★ f-string禁止。formatのみ。
+    prompt = """
 あなたは天気予報キャスターです。仙台向け「気圧痛予報」の本文だけを書いてください。
 
 【本文の型（固定）】
 ・3文固定、改行なし
-・1文目：気圧が主役（方向と強さを短く。{material["pressure_label"]}／振れ幅{material["range"]}hPa／6→24差{material["delta"]:+d}hPa）
-・2文目：補足（気温差{material["temp_range"]}℃、露点最大{material["dew_max"]}℃を“体感”として控えめに触れる）
+・1文目：気圧が主役（{pressure_label}／振れ幅{range}hPa／6→24差{delta:+d}hPa）
+・2文目：補足（気温差{temp_range}℃、露点最大{dew_max}℃を“体感”として控えめに触れる）
 ・3文目：締め（{style} で締める）
   - 安心：落ち着いた一日になりそう／心ほどける時間を、など
   - 軽い注意：無理のない範囲で／いつもより丁寧に、など
@@ -275,3 +289,245 @@ def gemini_body(material, prev_body: str = ""):
 ・怖がらせない／宣伝しない／医療の断定や指示をしない
 ・120〜130文字程度
 ・本文のみ出力
+
+【前回本文（言い回しの重複を避ける）】
+{prev_body}
+
+総合レベル: {total_level}
+""".format(
+        pressure_label=material["pressure_label"],
+        range=material["range"],
+        delta=material["delta"],
+        temp_range=material["temp_range"],
+        dew_max=material["dew_max"],
+        style=style,
+        prev_body=prev_body if prev_body else "（なし）",
+        total_level=material["total_level"]
+    )
+
+    return _try_generate(prompt, GEMINI_TEMP)
+
+def gemini_extra(material, prev_extra: str = ""):
+    prompt = """
+あなたは天気予報キャスターです。仙台向け気圧痛予報の「追加のひとこと」だけを書いてください。
+
+【条件】
+・1〜2文、改行なし
+・70〜100文字
+・内容は「今日は変動が強めなので、ゆったりめに」程度のやさしい注意喚起や体感の補足
+・怖がらせない／宣伝しない／医療の断定や指示をしない
+・本文のみ出力
+
+【口調の厳守】
+・必ず「です／ます」調で統一（です・ますを必ず入れる）
+・禁止語：「〜かもね」「〜だね」「〜だよ」「〜してね」「みたい」「〜じゃん」
+・二人称（あなた／みなさん）禁止
+・前回と同じ言い回しを避ける
+
+【前回の追加ひとこと（重複回避）】
+{prev_extra}
+
+気圧: {pressure_label}
+総合レベル: {total_level}
+""".format(
+        prev_extra=prev_extra if prev_extra else "（なし）",
+        pressure_label=material["pressure_label"],
+        total_level=material["total_level"]
+    )
+
+    return _try_generate(prompt, GEMINI_TEMP)
+
+def build_head(today, base, h12, h18, h24,
+               greeting="おはようございます。整体院コクリの今日の気圧痛予報です"):
+    return (
+        f"【仙台｜低気圧頭痛・気圧痛予報】{today.strftime('%m月%d日')}\n"
+        f"{greeting}\n\n"
+        f"・12時{h12}hPa({h12-base:+d})\n"
+        f"・18時{h18}hPa({h18-base:+d})\n"
+        f"・24時{h24}hPa({h24-base:+d})\n"
+        f"（朝6時基準 {base}hPa）"
+    ).strip()
+
+# =========================
+# 投稿処理
+# =========================
+def post_forecast():
+    now = now_jst()
+    today = now.date()
+
+    try:
+        times, pressures, temps, hums, dews = fetch_weather()
+        times_dt = [datetime.fromisoformat(t).replace(tzinfo=TZ) for t in times]
+
+        tmap = {}
+        for t, p, tmp, h, dw in zip(times_dt, pressures, temps, hums, dews):
+            if p is None or tmp is None:
+                continue
+            tmap[t] = {
+                "pressure": float(p),
+                "temp": float(tmp),
+                "hum": float(h) if h is not None else 0.0,
+                "dew": float(dw) if dw is not None else 0.0,
+            }
+
+        if not tmap:
+            print("Error: 有効な気象データがありません")
+            return
+
+        # 基準（朝6時：最寄り）
+        base_dt = datetime.combine(today, dtime(6, 0), TZ)
+        base_key = get_closest(base_dt, tmap)
+        base = int(round(tmap[base_key]["pressure"]))
+
+        def get_hour(hour):
+            if hour == 24:
+                dt = datetime.combine(today + timedelta(days=1), dtime(0, 0), TZ)
+            else:
+                dt = datetime.combine(today, dtime(hour, 0), TZ)
+            key = get_closest(dt, tmap)
+            return tmap[key]
+
+        d12 = get_hour(12)
+        d18 = get_hour(18)
+        d24 = get_hour(24)
+
+        h12 = int(round(d12["pressure"]))
+        h18 = int(round(d18["pressure"]))
+        h24 = int(round(d24["pressure"]))
+
+        pressure_level, label, day_range, delta = classify_pressure(base, h12, h18, h24)
+
+        temp_vals = [d12["temp"], d18["temp"], d24["temp"]]
+        temp_range = int(round(max(temp_vals) - min(temp_vals)))
+
+        dew_max = int(round(max(d12["dew"], d18["dew"], d24["dew"])))
+
+        amplifier = classify_amplifier(temp_range, dew_max)
+        total_level = pressure_level + amplifier
+
+        material = {
+            "pressure_label": label,
+            "range": day_range,
+            "delta": delta,
+            "temp_range": temp_range,
+            "dew_max": dew_max,
+            "total_level": total_level,
+        }
+
+        head = build_head(today, base, h12, h18, h24)
+
+        # 画像アップロード
+        media_id = None
+        try:
+            if os.path.exists(BANNER_PATH):
+                media = x_api_v1.media_upload(BANNER_PATH)
+                media_id = getattr(media, "media_id_string", None) or str(media.media_id)
+        except Exception as e:
+            print("media_upload ERROR:", repr(e))
+            media_id = None
+
+        # 1ツイート目
+        try:
+            if media_id:
+                first = x_client.create_tweet(text=head, media_ids=[media_id], user_auth=True)
+            else:
+                first = x_client.create_tweet(text=head, user_auth=True)
+        except Exception as e:
+            print("create_tweet(head) ERROR:", repr(e))
+            return
+
+        parent_id = first.data["id"]
+
+        # 投稿成功とみなす
+        set_last_post_date(today)
+
+        # 前回テキスト取得（類似回避用）
+        prev_body, prev_extra = get_last_texts()
+
+        # 本文生成
+        body = gemini_body(material, prev_body=prev_body)
+        if not body:
+            style = closing_style(total_level)
+            if style == "安心":
+                tail = "落ち着いた一日になりそうです。"
+            elif style == "軽い注意":
+                tail = "無理のない範囲で、いつもより丁寧にお過ごしください。"
+            else:
+                tail = "予定は詰めすぎず、ゆったりめにお過ごしください。"
+
+            body = (
+                f"気圧は{label}で、振れ幅{day_range}hPa、6→24差{delta:+d}hPaです。"
+                f"気温差は{temp_range}℃、露点最大は{dew_max}℃です。"
+                f"{tail}"
+            )
+
+        # 分割投稿
+        body_parts = split_by_sentence(body, TWEET_LIMIT)
+        for p in body_parts:
+            try:
+                res = x_client.create_tweet(
+                    text=p,
+                    in_reply_to_tweet_id=parent_id,
+                    user_auth=True
+                )
+                parent_id = res.data["id"]
+            except tweepy.errors.Forbidden as e:
+                print(f"reply Forbidden(403): Text length: {len(p)} / Error: {e}")
+                break
+            except Exception as e:
+                print("reply ERROR:", repr(e))
+                break
+
+        # 追加のひとこと（レベル4以上）
+        extra = ""
+        if total_level >= 4:
+            extra = gemini_extra(material, prev_extra=prev_extra)
+            if extra:
+                try:
+                    x_client.create_tweet(
+                        text=extra,
+                        in_reply_to_tweet_id=parent_id,
+                        user_auth=True
+                    )
+                except Exception as e:
+                    print("extra ERROR:", repr(e))
+
+        # 今回の文面を保存（翌日の類似回避に使う）
+        set_last_texts(body=body, extra=extra)
+
+        print("投稿完了")
+
+    except Exception as e:
+        print("post_forecast FATAL ERROR:", repr(e))
+        return
+
+# =========================
+# 常駐
+# =========================
+def run_bot():
+    print("気圧痛予報BOT 起動")
+    print("NOW(JST):", now_jst().isoformat())
+    print("GEMINI_LIB:", genai.__version__ if hasattr(genai, "__version__") else "Unknown")
+
+    if FORCE_POST:
+        print("強制投稿モード")
+        post_forecast()
+        return
+
+    if DEPLOY_RUN:
+        if get_last_post_date() != now_jst().date():
+            print("再起動時投稿")
+            post_forecast()
+
+    while True:
+        now = now_jst()
+        today = now.date()
+
+        if get_last_post_date() != today and now.hour >= POST_HOUR:
+            print(f"定時投稿: {now}")
+            post_forecast()
+
+        time.sleep(60)
+
+if __name__ == "__main__":
+    run_bot()
