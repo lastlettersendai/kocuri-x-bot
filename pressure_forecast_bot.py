@@ -189,12 +189,18 @@ def closing_style(total_level):
 # Gemini 設定＆生成ロジック
 # =========================
 SAFETY_SETTINGS = [
-    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                        threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH),
-    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                        threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH),
-    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                        threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH),
+    types.SafetySetting(
+        category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH
+    ),
+    types.SafetySetting(
+        category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+        threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH
+    ),
+    types.SafetySetting(
+        category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH
+    ),
 ]
 
 def gemini_generate(prompt: str) -> str:
@@ -208,24 +214,34 @@ def gemini_generate(prompt: str) -> str:
             )
         )
         text = (r.text or "").strip()
+        # 改行などをスペースに潰す（改行禁止ルールの保険）
         return re.sub(r"\s+", " ", text)
     except Exception as e:
         print("Gemini error:", repr(e))
         return ""
 
-def gemini_body(material, prev_body: str = "", mmdd: str = ""):
+def gemini_body(material, prev_body: str = "", mmdd_text: str = ""):
+    # f-string中のクォート事故を避けるため先に展開
+    style = closing_style(material["total_level"])
+    pressure_label = material["pressure_label"]
+    range_hpa = material["range"]
+    delta_val = material["delta"]
+    temp_range = material["temp_range"]
+    dew_max = material["dew_max"]
+
     prompt = f"""
-あなたは天気予報キャスターです。以下のデータを使って、気圧痛に悩む方向けのX投稿文を120文字程度で作成してください。
+あなたは天気予報キャスターです。以下のデータを使って、気圧痛に悩む方向けのX投稿文を作成してください。
 
 【データ】
-・気圧変化：{material['pressure_label']}（振れ幅 {material['range']}hPa / 6→24時差 {material['delta']:+d}hPa）
-・気温差：{material['temp_range']}℃
-・露点最大：{material['dew_max']}℃
-・アドバイス基準：{closing_style(material['total_level'])}
+・日付：{mmdd_text}
+・気圧変化：{pressure_label}（振れ幅 {range_hpa}hPa / 6→24時差 {delta_val:+d}hPa）
+・気温差：{temp_range}℃
+・露点最大：{dew_max}℃
+・アドバイス基準：{style}
 
 【構成（厳守）】
 ・必ず3文で構成すること。
-・1文目：数値を含めた今日({mmdd})の気圧状況を具体的に。
+・1文目：数値を含めた「{mmdd_text}は〜」で始め、気圧状況を具体的に。
 ・2文目：露点の数値を専門用語を使わず体感に翻訳し、情景が浮かぶ一文に。
 ・3文目：穏やかで具体性のある過ごし方を一文で。
 
@@ -236,18 +252,18 @@ def gemini_body(material, prev_body: str = "", mmdd: str = ""):
 ・「露点」という語は使わない
 ・文頭に見出しや【】は付けない
 ・前回（{prev_body if prev_body else "なし"}）とは違う表現
-・今日({mmdd})の内容として書く
 ・改行なし
-"""
+""".strip()
+
     return gemini_generate(prompt)
 
-def gemini_extra(material, prev_extra: str = "", mmdd: str = ""):
+def gemini_extra(material, prev_extra: str = ""):
     prompt = f"""
-気圧変動が強めの日の追加のひとことを70文字程度で作成してください。
+気圧変動が強めの日の追加のひとことを70〜90文字程度で作成してください。
 です/ます調。不安を煽らない。
 前回（{prev_extra if prev_extra else "なし"}）とは違う表現にする。
-改行なし。
-"""
+改行なし。見出しや【】は禁止。
+""".strip()
     return gemini_generate(prompt)
 
 # =========================
@@ -256,7 +272,7 @@ def gemini_extra(material, prev_extra: str = "", mmdd: str = ""):
 def post_forecast():
     now = now_jst()
     today = now.date()
-    mmdd = now.strftime("%m/%d")
+    mmdd_text = f"{now.month}月{now.day}日"
 
     try:
         times, pressures, temps, hums, dews = fetch_weather()
@@ -271,6 +287,10 @@ def post_forecast():
                 "temp": float(tmp),
                 "dew": float(dw) if dw else 0.0,
             }
+
+        if not tmap:
+            print("FATAL: weather map is empty")
+            return
 
         base_dt = datetime.combine(today, dtime(6, 0), TZ)
         base_key = min(tmap.keys(), key=lambda k: abs((k - base_dt).total_seconds()))
@@ -320,22 +340,21 @@ def post_forecast():
 
         prev_body, prev_extra = get_last_texts()
 
-        # 本文とタグの生成
-        body = gemini_body(material, prev_body, mmdd)
-        # 万が一AIが空文字を返した時の安全装置
-        if not body:
-            body = f"今日は気圧変化が{label}で、振れ幅{day_range}hPaです。気温差は{temp_range}℃です。無理のない範囲でお過ごしください。"
-            
-        extra = gemini_extra(material, prev_extra, mmdd) if total_level >= 4 else ""
-        uniq_tag = f" ({mmdd} Δ{delta:+d} R{day_range})"
+        # 本文生成（末尾タグは付けない）
+        body = gemini_body(material, prev_body, mmdd_text)
 
-        # 140文字対策：タグを含めてもオーバーしないように安全に分割する
-        safe_limit = TWEET_LIMIT - len(uniq_tag)
-        body_parts = split_by_sentence(body, safe_limit)
-        if body_parts:
-            body_parts[-1] += uniq_tag # 最後のパーツに必ずタグをつける
-        else:
-            body_parts = [uniq_tag]
+        # 万が一AIが空文字を返した時の安全装置（表記は「2月19日」形式）
+        if not body:
+            body = (
+                f"{mmdd_text}は気圧変化が{label}で、振れ幅{day_range}hPa、6→24時差{delta:+d}hPaです。"
+                f"気温差は{temp_range}℃です。無理のない範囲でお過ごしください。"
+            )
+
+        # 文字数対策（タグ無しなのでそのまま135で分割）
+        body_parts = split_by_sentence(body, TWEET_LIMIT)
+
+        # 追加のひとこと（条件次第）
+        extra = gemini_extra(material, prev_extra) if total_level >= 4 else ""
 
         # 画像アップロード（安全な取得とエラーハンドリング）
         media_id = None
@@ -347,18 +366,18 @@ def post_forecast():
                 print("media_upload error:", repr(e))
                 media_id = None
 
-        # API仕様変更に対応した安全な辞書渡し
+        # 1ツイート目（head）
         tweet_params = {"text": head, "user_auth": True}
         if media_id:
             tweet_params["media_ids"] = [media_id]
 
         first = x_client.create_tweet(**tweet_params)
         parent_id = str(first.data["id"])
-        
+
         time.sleep(REPLY_WAIT_SEC)
         ok = True
 
-        # 本文（2ツイート目以降）を投稿
+        # 本文（2ツイート目以降）
         for p in body_parts:
             try:
                 res = x_client.create_tweet(
@@ -373,7 +392,7 @@ def post_forecast():
                 ok = False
                 break
 
-        # 追加のひとこと（条件次第）
+        # 追加のひとこと
         if ok and extra:
             extra_parts = split_by_sentence(extra, TWEET_LIMIT)
             for ep in extra_parts:
